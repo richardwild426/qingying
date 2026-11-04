@@ -137,6 +137,18 @@ XML），取第一个 `<entry>` 的 `<title>` 作为 tag。
 网络访问在 `nsh.json` 的 `capabilities.network.hosts` 里只授权了 `github.com`，
 其余主机一律拒绝。
 
+## 应用内更新
+
+点「立即更新」后：下载 DMG → 挂载 → 把运行中的 bundle 换成新的 → 显示「已装好，重启生效」
+和「重启」按钮。不用离开应用。
+
+旧版本先被移开再复制新的，复制失败会恢复回去——半途失败不会留下不能用的 app。
+
+**注意 `capabilities`**：`nsh.json` 里声明了 `network.hosts`（`github.com` 和
+`release-assets.githubusercontent.com`，后者是 GitHub 下载的跳转目标）。但 nsh 0.2.0
+**对 Rust 应用不校验这个字段**——写个非法键也不会报错，也不会生成 `capabilities.json`。
+按文档，没有 capabilities 的独立应用本来就不受限，所以功能正常；这个声明是为将来
+nsh 版本生效时准备的。
 ## 依赖
 
 - `ffmpeg` 和 `ffprobe` 在 `PATH` 里（`brew install ffmpeg`）
