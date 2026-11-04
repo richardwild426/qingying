@@ -583,6 +583,19 @@ enum UpdateCheck {
         current: String,
         latest: String,
         url: String,
+        /// The release asset this platform installs.
+        asset: String,
+    },
+    /// The DMG is downloading; `received` of `total` bytes, 0 if unknown.
+    Downloading {
+        latest: String,
+        received: u64,
+        total: u64,
+    },
+    /// Downloaded and installed: the new version is on disk, waiting for a
+    /// relaunch.
+    Installed {
+        latest: String,
     },
     Failed {
         message: String,
@@ -617,6 +630,136 @@ fn is_newer(latest: &str, current: &str) -> bool {
         }
     }
     false
+}
+
+/// The release asset this platform installs, from a tag and the app's name.
+///
+/// The name is the one the workflow uploads, built from the same rule, so a
+/// download needs no API call and no extra metadata.
+const ASSET_NAME: &str = "QingYing-macos-arm64.dmg";
+
+/// Where the DMG for `tag` lives. GitHub serves it from a fixed path, so the
+/// URL can be built without asking the API first.
+fn asset_url(tag: &str) -> String {
+    format!("https://github.com/richardwild426/qingying/releases/download/{tag}/{ASSET_NAME}")
+}
+
+/// This app's bundle name, e.g. `轻影.app`.
+///
+/// Taken from the running executable's path rather than a constant: the bundle
+/// is what gets replaced, and the image holds a copy with the same name.
+fn bundle_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.ancestors()
+                .find(|p| p.extension().is_some_and(|e| e == "app"))
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().to_string())
+        })
+        .unwrap_or_else(|| "轻影.app".to_string())
+}
+
+/// Where the downloaded image is written before mounting.
+fn temp_dmg_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    Some(dir.join("qingying-update.dmg"))
+}
+
+/// What a download reports back to the engine thread.
+enum DownloadEvent {
+    Installed,
+    Failed(String),
+}
+
+/// Mount the image, copy the app over the running one, and unmount.
+///
+/// Runs on a worker thread: it shells out to `hdiutil`, which blocks. The
+/// bundle is replaced in place, which works while it runs — macOS keeps the
+/// old executable mapped until the process exits, so the new files land on
+/// disk and take effect on the next launch.
+fn install_from_dmg(dmg: &PathBuf, app_name: &str) -> Result<(), String> {
+    let mount = "/Volumes/QingYingUpdate";
+    let _ = std::process::Command::new("/usr/bin/hdiutil")
+        .args(["detach", mount, "-force"])
+        .output();
+
+    let attach = std::process::Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-mountpoint", mount])
+        .arg(dmg)
+        .output()
+        .map_err(|e| format!("挂载失败：{e}"))?;
+    if !attach.status.success() {
+        return Err(format!(
+            "挂载失败：{}",
+            String::from_utf8_lossy(&attach.stderr).trim()
+        ));
+    }
+
+    // Everything watched below happens while the image is mounted, so the
+    // failure path must unmount too.
+    let source = PathBuf::from(mount).join(app_name);
+    let result = (|| -> Result<(), String> {
+        if !source.is_dir() {
+            return Err(format!("镜像里没有 {app_name}"));
+        }
+
+        // Where this app lives now: /Applications/轻影.app.
+        let exe = std::env::current_exe().map_err(|e| format!("找不到自身位置：{e}"))?;
+        let target = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .ok_or("自身位置不对")?
+            .to_path_buf();
+        trace(&format!(
+            "[update] {} -> {}",
+            source.display(),
+            target.display()
+        ));
+
+        // Replace the bundle: a copy over a live app can leave a half-written
+        // one if it fails, so the old one is moved aside first and restored
+        // when the copy does not land.
+        if !target.is_dir() {
+            return Err(format!("当前应用不在 {}，无法就地替换", target.display()));
+        }
+        let backup = target.with_extension("app.old");
+        let _ = std::fs::remove_dir_all(&backup);
+        std::fs::rename(&target, &backup).map_err(|e| format!("无法移开旧版本：{e}"))?;
+
+        let copied = std::process::Command::new("/usr/bin/ditto")
+            .arg(&source)
+            .arg(&target)
+            .output();
+        match copied {
+            Ok(out) if out.status.success() => {
+                let _ = std::fs::remove_dir_all(&backup);
+                Ok(())
+            }
+            Ok(out) => {
+                let _ = std::fs::remove_dir_all(&target);
+                let _ = std::fs::rename(&backup, &target);
+                Err(format!(
+                    "复制新版本失败：{}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ))
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&target);
+                let _ = std::fs::rename(&backup, &target);
+                Err(format!("复制新版本失败：{e}"))
+            }
+        }
+    })();
+
+    let _ = std::process::Command::new("/usr/bin/hdiutil")
+        .args(["detach", mount, "-force"])
+        .output();
+
+    result
 }
 
 /// Read the newest release's tag from the Atom feed.
@@ -1037,6 +1180,7 @@ pub fn App() -> impl IntoElement {
                                     current,
                                     latest: tag,
                                     url,
+                                    asset: ASSET_NAME.to_string(),
                                 });
                             } else {
                                 update.set(UpdateCheck::UpToDate { current });
@@ -1049,6 +1193,96 @@ pub fn App() -> impl IntoElement {
                     }),
                     Err(message) => update.set(UpdateCheck::Failed { message }),
                 }
+            });
+        }
+    };
+
+    // Download the release's DMG and swap the running bundle for it.
+    //
+    // `fetch` must be awaited on the engine thread's runtime, and mounting
+    // shells out to `hdiutil`, which blocks. So: fetch in a task, then hand
+    // the bytes to a worker for writing and installing, and let the engine
+    // thread apply what it reports.
+    let install_now = {
+        move || {
+            let UpdateCheck::Available { latest, .. } = update.get() else {
+                return;
+            };
+            if matches!(
+                update.get(),
+                UpdateCheck::Downloading { .. } | UpdateCheck::Installed { .. }
+            ) {
+                return;
+            }
+            update.set(UpdateCheck::Downloading {
+                latest: latest.clone(),
+                received: 0,
+                total: 0,
+            });
+
+            let name = bundle_name();
+            spawn(async move {
+                let url = asset_url(&latest);
+                trace(&format!("[update] downloading {url}"));
+                let bytes = match fetch(HttpRequest::get(&url)).await {
+                    Ok(r) if r.ok() => r.body,
+                    Ok(r) => {
+                        update.set(UpdateCheck::Failed {
+                            message: format!("下载失败：HTTP {}", r.status()),
+                        });
+                        return;
+                    }
+                    Err(message) => {
+                        update.set(UpdateCheck::Failed { message });
+                        return;
+                    }
+                };
+                trace(&format!("[update] {} bytes", bytes.len()));
+
+                // The bytes must hit disk before hdiutil can mount them.
+                let (tx, rx) = std::sync::mpsc::channel::<DownloadEvent>();
+                std::thread::spawn(move || {
+                    let Some(dmg) = temp_dmg_path() else {
+                        let _ = tx.send(DownloadEvent::Failed("找不到临时目录".into()));
+                        return;
+                    };
+                    if let Err(e) = std::fs::write(&dmg, &bytes) {
+                        let _ = tx.send(DownloadEvent::Failed(format!("写入镜像失败：{e}")));
+                        return;
+                    }
+                    let event = match install_from_dmg(&dmg, &name) {
+                        Ok(()) => DownloadEvent::Installed,
+                        Err(message) => DownloadEvent::Failed(message),
+                    };
+                    let _ = std::fs::remove_file(&dmg);
+                    let _ = tx.send(event);
+                });
+
+                // Poll the worker on the engine thread, as the picker does.
+                let finished = std::rc::Rc::new(std::cell::RefCell::new(Some(rx)));
+                let done = signal(false);
+                set_interval(Duration::from_millis(120), move || {
+                    if done.get() {
+                        return;
+                    }
+                    let Some(rx) = finished.borrow_mut().take() else {
+                        return;
+                    };
+                    match rx.try_recv() {
+                        Ok(DownloadEvent::Installed) => {
+                            done.set(true);
+                            update.set(UpdateCheck::Installed {
+                                latest: latest.clone(),
+                            });
+                        }
+                        Ok(DownloadEvent::Failed(message)) => {
+                            done.set(true);
+                            update.set(UpdateCheck::Failed { message });
+                        }
+                        Err(TryRecvError::Empty) => *finished.borrow_mut() = Some(rx),
+                        Err(TryRecvError::Disconnected) => done.set(true),
+                    }
+                });
             });
         }
     };
@@ -1499,13 +1733,24 @@ pub fn App() -> impl IntoElement {
                                                 UpdateCheck::Available { latest, .. } => {
                                                     format!("有新版本 {latest}")
                                                 }
+                                                UpdateCheck::Downloading {
+                                                    received, ..
+                                                } => {
+                                                    let mb =
+                                                        received as f64 / 1048576.0;
+                                                    format!("下载中 {mb:.1} MB")
+                                                }
+                                                UpdateCheck::Installed { .. } => {
+                                                    "已更新".to_string()
+                                                }
                                                 UpdateCheck::Failed { .. } => {
                                                     "检查失败，重试".to_string()
                                                 }
                                             })
                                             .text_size(px(11.0))
                                             .text_color(move || match update.get() {
-                                                UpdateCheck::Available { .. } => theme().primary,
+                                                UpdateCheck::Available { .. }
+                                                | UpdateCheck::Installed { .. } => theme().primary,
                                                 UpdateCheck::Failed { .. } => theme().destructive,
                                                 _ => theme().muted_foreground,
                                             }),
@@ -1524,6 +1769,7 @@ pub fn App() -> impl IntoElement {
                                         .text_color(move || theme().destructive)
                                     },
                                 ))
+                                // Update: download and install in place.
                                 .child(when(
                                     move || {
                                         matches!(update.get(), UpdateCheck::Available { .. })
@@ -1535,19 +1781,55 @@ pub fn App() -> impl IntoElement {
                                             .py_1()
                                             .bg(move || theme().primary)
                                             .active(|s| s.opacity(0.7))
-                                            .on_press(move || {
-                                                let url = match update.get() {
-                                                    UpdateCheck::Available { url, .. } => url,
-                                                    _ => RELEASES_PAGE.to_string(),
-                                                };
-                                                let _ = std::process::Command::new("open")
-                                                    .arg(url)
-                                                    .status();
-                                            })
+                                            .on_press(move || install_now())
                                             .child(
-                                                text("去下载")
+                                                text("立即更新")
                                                     .text_size(px(11.0))
                                                     .text_color(move || theme().primary_foreground),
+                                            )
+                                    },
+                                ))
+                                // Installed: the new bundle is on disk, the
+                                // running process is still the old code.
+                                .child(when(
+                                    move || matches!(update.get(), UpdateCheck::Installed { .. }),
+                                    move || {
+                                        view()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                text("已装好，重启生效")
+                                                    .text_size(px(10.0))
+                                                    .text_color(move || theme().muted_foreground),
+                                            )
+                                            .child(
+                                                view()
+                                                    .rounded(px(6.0))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .bg(move || theme().primary)
+                                                    .active(|s| s.opacity(0.7))
+                                                    .on_press(move || {
+                                                        let exe = std::env::current_exe().ok();
+                                                        let bundle = bundle_name();
+                                                        // The new copy is in
+                                                        // /Applications already.
+                                                        let _ = std::process::Command::new("open")
+                                                            .arg(format!("/Applications/{bundle}"))
+                                                            .status();
+                                                        let _ = exe;
+                                                        // Quit so the fresh
+                                                        // bundle is what runs.
+                                                        std::process::exit(0);
+                                                    })
+                                                    .child(
+                                                        text("重启")
+                                                            .text_size(px(11.0))
+                                                            .text_color(move || {
+                                                                theme().primary_foreground
+                                                            }),
+                                                    ),
                                             )
                                     },
                                 )),
