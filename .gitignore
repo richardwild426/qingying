@@ -1,2 +1,6 @@
 .nsh/
 target/
+
+# Build output the CI workflow and local packaging produce
+*.zip
+*.app/

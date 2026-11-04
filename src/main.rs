@@ -19,9 +19,8 @@ fn main() -> impl std::process::Termination {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("qingying.log");
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    );
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"));
     if let Ok(file) = std::fs::File::create(&log_path) {
         builder.target(env_logger::Target::Pipe(Box::new(file)));
     }

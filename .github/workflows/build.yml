@@ -1,0 +1,141 @@
+name: Build macOS app
+
+# 轻影 ships for Apple Silicon only. `nsh package` builds the runner for the
+# machine it runs on, so this job must run on an arm64 runner, and the result
+# is checked with lipo before it is published.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The display name, which is also the .app directory's name.
+  APP_NAME: 轻影
+  # A URL-safe name for the files we publish.
+  ARTIFACT: QingYing-macos-arm64
+
+jobs:
+  build:
+    name: Package (arm64)
+    # macos-14 and later run on Apple Silicon; macos-13 is Intel and would
+    # produce an x86_64 binary.
+    runs-on: macos-14
+    timeout-minutes: 40
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Assert Apple Silicon
+        run: |
+          uname -m
+          if [ "$(uname -m)" != "arm64" ]; then
+            echo "::error::This job must run on Apple Silicon to produce an arm64 app."
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      # Building the NSH runner dominates a cold run.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-cargo-
+
+      - name: Install nsh
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh
+          # The installer links ~/.local/bin/nsh; later steps need it on PATH.
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/nsh" --version
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run the tests
+        run: nsh test
+
+      - name: Package the app
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # A branch build still needs a version; nsh.json's is the fallback.
+          case "$version" in
+            v*|[0-9]*) ;;
+            *) version="$(plutil -extract version raw -o - nsh.json 2>/dev/null || echo 0.0.0)" ;;
+          esac
+          nsh package --target macos \
+            --app-version "$version" \
+            --build "${{ github.run_number }}"
+
+      - name: Verify the binary is arm64 only
+        run: |
+          APP=".nsh/out/${APP_NAME}.app"
+          test -d "$APP" || { echo "::error::No .app was produced"; exit 1; }
+
+          NAME="$(plutil -extract CFBundleExecutable raw -o - "$APP/Contents/Info.plist")"
+          EXEC="$APP/Contents/MacOS/$NAME"
+          test -f "$EXEC" || { echo "::error::No executable at $EXEC"; exit 1; }
+
+          ARCHS="$(lipo -archs "$EXEC")"
+          echo "architectures: $ARCHS"
+
+          echo "$ARCHS" | grep -qw arm64 || {
+            echo "::error::The app is not arm64."
+            exit 1
+          }
+          if echo "$ARCHS" | grep -qw x86_64; then
+            echo "::error::The app carries an x86_64 slice; it should be Apple Silicon only."
+            exit 1
+          fi
+
+      # `zip -ry` keeps symlinks and permissions without the `__MACOSX`
+      # sidecar `ditto` would add at the archive's root.
+      - name: Archive the app
+        run: |
+          OUT="$(pwd)/${ARTIFACT}.zip"
+          (cd .nsh/out && zip -qry "$OUT" "${APP_NAME}.app")
+          ls -lh "${ARTIFACT}.zip"
+          # The bundle must still be signed after archiving.
+          rm -rf /tmp/unzipped
+          unzip -q "${ARTIFACT}.zip" -d /tmp/unzipped
+          codesign -dv "/tmp/unzipped/${APP_NAME}.app" 2>&1 | head -3
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: ${{ env.ARTIFACT }}.zip
+          if-no-files-found: error
+
+      - name: Attach it to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+
+          gh release upload "$GITHUB_REF_NAME" "${ARTIFACT}.zip" --clobber
+          gh release edit "$GITHUB_REF_NAME" --notes-file .github/release-notes.md
