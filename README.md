@@ -106,6 +106,21 @@ cp /tmp/iconout/icon.svg.png assets/icon.png
 注意：固定宽度（如 `.w(px(500))`）在窄于该宽度的窗口里会裁掉右边的内容。
 用 `w_full` + `max_w` 才跟着窗口走。
 
+
+## 发布
+
+推 `v*` 标签会触发 GitHub Actions（`.github/workflows/build.yml`）：在 Apple Silicon
+runner 上构建、测试、打包、校验架构，然后产出 **DMG** 挂到该 tag 的 Release 上。
+
+DMG 由 `.github/make-dmg.sh` 制作：里面是 app 加一个指向 `/Applications` 的链接，
+窗口位置也设好了（app 在左、Applications 在右，128pt 图标），打开后把 app 拖过去就装好了。
+
+脚本在返回前会自己验证：镜像校验和、app 和链接都在、ad-hoc 签名有效、架构是 arm64。
+
+**版本必须与 `Cargo.toml` 里的 `nsh-*` 一致。** workflow 用 `NSH_VERSION: v0.2.0`
+固定 nsh 的版本，因为 CLR 会拒绝构建依赖旧版 crate 的项目；升级 `Cargo.toml` 时
+记得同步改这里。
+
 ## 依赖
 
 - `ffmpeg` 和 `ffprobe` 在 `PATH` 里（`brew install ffmpeg`）
