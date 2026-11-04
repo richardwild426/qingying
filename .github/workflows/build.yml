@@ -116,23 +116,22 @@ jobs:
             exit 1
           fi
 
-      # `zip -ry` keeps symlinks and permissions without the `__MACOSX`
-      # sidecar `ditto` would add at the archive's root.
-      - name: Archive the app
+      # A drag-to-install disk image: the app next to a link to
+      # /Applications, laid out the way every Mac app ships. The script
+      # verifies the image, its contents and the signature before returning.
+      - name: Build the DMG
         run: |
-          OUT="$(pwd)/${ARTIFACT}.zip"
-          (cd .nsh/out && zip -qry "$OUT" "${APP_NAME}.app")
-          ls -lh "${ARTIFACT}.zip"
-          # The bundle must still be signed after archiving.
-          rm -rf /tmp/unzipped
-          unzip -q "${ARTIFACT}.zip" -d /tmp/unzipped
-          codesign -dv "/tmp/unzipped/${APP_NAME}.app" 2>&1 | head -3
+          bash .github/make-dmg.sh \
+            ".nsh/out/${APP_NAME}.app" \
+            "${APP_NAME}" \
+            "${ARTIFACT}.dmg"
+          ls -lh "${ARTIFACT}.dmg"
 
       - name: Upload the build
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT }}
-          path: ${{ env.ARTIFACT }}.zip
+          path: ${{ env.ARTIFACT }}.dmg
           if-no-files-found: error
 
       - name: Attach it to the release
@@ -145,5 +144,5 @@ jobs:
               --title "$GITHUB_REF_NAME" \
               --generate-notes
 
-          gh release upload "$GITHUB_REF_NAME" "${ARTIFACT}.zip" --clobber
+          gh release upload "$GITHUB_REF_NAME" "${ARTIFACT}.dmg" --clobber
           gh release edit "$GITHUB_REF_NAME" --notes-file .github/release-notes.md
