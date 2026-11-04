@@ -62,12 +62,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-arm64-cargo-
 
+      # The version must match the nsh-* crates in Cargo.toml: a newer CLI
+      # refuses to build an app that asks for an older one. Keep these in step.
       - name: Install nsh
+        env:
+          NSH_VERSION: v0.2.0
         run: |
           curl -fsSL https://nsh.dev/install.sh | sh
           # The installer links ~/.local/bin/nsh; later steps need it on PATH.
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/nsh" --version
+          "$HOME/.local/bin/nsh" --version | tee /tmp/nsh-version
+          grep -q "0.2.0" /tmp/nsh-version || {
+            echo "::error::nsh is not 0.2.0; Cargo.toml asks for nsh-* 0.2.0 and a newer CLI refuses it."
+            exit 1
+          }
 
       - name: Check formatting
         run: cargo fmt --check
