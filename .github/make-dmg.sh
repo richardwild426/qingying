@@ -73,6 +73,10 @@ end tell
 EOF
 sync
 
+# The system drops its FSEvents log onto a mounted volume; it has no business
+# in a release image.
+rm -rf "$MOUNT_POINT/.fseventsd"
+
 echo "→ compressing"
 hdiutil detach "$MOUNT_POINT" >/dev/null
 hdiutil convert "$TEMP_DMG" -format UDZO -imagekey zlib-level=9 -o "$OUT_DMG" >/dev/null
