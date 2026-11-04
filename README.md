@@ -121,6 +121,22 @@ DMG 由 `.github/make-dmg.sh` 制作：里面是 app 加一个指向 `/Applicati
 固定 nsh 的版本，因为 CLR 会拒绝构建依赖旧版 crate 的项目；升级 `Cargo.toml` 时
 记得同步改这里。
 
+
+## 检查更新
+
+窗口底部显示当前版本，旁边是「检查更新」按钮。手动点击才发起请求，不后台轮询。
+
+版本来源是 `Contents/Resources/nsh/app.json` 的 `version` 字段（`nsh package` 写入，
+CI 用 `--app-version` 覆盖），所以显示的和 Finder 里看到的始终一致。
+
+**为什么用 Atom feed 而不是 GitHub REST API**：`api.github.com` 对未认证请求限
+60 次/小时/IP，共用出口 IP 时很容易被耗尽，检查就会一律失败。改用
+`releases.atom`——纯 XML、无需认证、没有速率限制。解析是手写的（整个应用只读这一处
+XML），取第一个 `<entry>` 的 `<title>` 作为 tag。
+
+网络访问在 `nsh.json` 的 `capabilities.network.hosts` 里只授权了 `github.com`，
+其余主机一律拒绝。
+
 ## 依赖
 
 - `ffmpeg` 和 `ffprobe` 在 `PATH` 里（`brew install ffmpeg`）

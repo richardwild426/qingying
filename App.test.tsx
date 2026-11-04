@@ -42,3 +42,12 @@ test("no result controls before a run", async () => {
   expect(texts).not.toContain("在访达中显示");
   expect(texts).not.toContain("打开");
 });
+
+// The updater's controls are in the window from the start; the check itself
+// is manual, so nothing is fetched until the user asks.
+test("offers a manual update check", async () => {
+  const app = await open(".");
+  const texts = app.texts();
+  expect(texts).toContain("检查更新");
+  expect(texts.join(" ")).toMatch(/轻影 \d+\.\d+\.\d+/);
+});

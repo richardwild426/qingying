@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use nsh_base::{safe_area_view, theme};
+use nsh_core::platform::HttpRequest;
 use nsh_core::ui::prelude::*;
 
 /// What a worker thread reports back to the engine thread.
@@ -529,6 +530,123 @@ fn encode_batch(inputs: Vec<PathBuf>, quality: Quality, tx: Sender<Update>) {
     });
 }
 
+/// This app's version, as the bundle records it.
+///
+/// `nsh package` writes the version into `Contents/Resources/nsh/app.json`
+/// from `nsh.json`, overridden by `--app-version` — which is what the release
+/// workflow passes. Reading it at run time keeps the updater's idea of "what
+/// I am" in step with what Finder shows, instead of a constant that has to be
+/// bumped by hand.
+fn current_version() -> String {
+    const FALLBACK: &str = env!("CARGO_PKG_VERSION");
+
+    let Ok(exe) = std::env::current_exe() else {
+        return FALLBACK.to_string();
+    };
+    // Contents/MacOS/<binary> -> Contents/Resources/nsh/app.json
+    let Some(contents) = exe.parent().and_then(|p| p.parent()) else {
+        return FALLBACK.to_string();
+    };
+    let manifest = contents.join("Resources/nsh/app.json");
+    let Ok(text) = std::fs::read_to_string(&manifest) else {
+        return FALLBACK.to_string();
+    };
+    // A one-key lookup, so no JSON parser: find `"version"` and read the
+    // string that follows it.
+    text.split("\"version\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').nth(1))
+        .map(str::to_owned)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| FALLBACK.to_string())
+}
+
+/// Where releases come from.
+///
+/// The Atom feed rather than `api.github.com`: the REST API allows 60
+/// unauthenticated requests an hour per address, which a shared or corporate
+/// address can exhaust and every check would then fail. The feed is plain
+/// XML, served to anyone, with no limits to hit.
+const RELEASES_FEED: &str = "https://github.com/richardwild426/qingying/releases.atom";
+const RELEASES_PAGE: &str = "https://github.com/richardwild426/qingying/releases/latest";
+
+/// What the update check found.
+#[derive(Clone, PartialEq)]
+enum UpdateCheck {
+    /// Nothing asked yet.
+    Idle,
+    Checking,
+    UpToDate {
+        current: String,
+    },
+    Available {
+        current: String,
+        latest: String,
+        url: String,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+/// Split `1.2.3` into comparable numbers, ignoring a leading `v`.
+///
+/// A tag like `v1.2.3-beta` compares as `1.2.3`: a pre-release is this app's
+/// own convention for something older than the release it precedes.
+fn version_parts(tag: &str) -> Vec<u64> {
+    tag.trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| {
+            let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Whether `latest` is newer than `current`.
+fn is_newer(latest: &str, current: &str) -> bool {
+    let (a, b) = (version_parts(latest), version_parts(current));
+    for i in 0..a.len().max(b.len()) {
+        let (x, y) = (
+            a.get(i).copied().unwrap_or(0),
+            b.get(i).copied().unwrap_or(0),
+        );
+        if x != y {
+            return x > y;
+        }
+    }
+    false
+}
+
+/// Read the newest release's tag from the Atom feed.
+///
+/// The feed's first entry is the most recent release; its `<title>` is the
+/// tag (`v1.0.0`) and its `<link href="…">` the page to open. Parsed by hand
+/// rather than with an XML crate: this is the only XML the app reads.
+fn parse_latest_release(body: &str) -> Result<(String, String), String> {
+    let entries = body.split("<entry>").nth(1).ok_or("发布源里没有版本记录")?;
+
+    let tag = entries
+        .split("<title>")
+        .nth(1)
+        .and_then(|rest| rest.split("</title>").next())
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .ok_or("发布源里没有版本号")?;
+
+    // The entry's link is the release page; fall back to the latest alias.
+    let url = entries
+        .split("href=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .filter(|u| u.starts_with("http"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| RELEASES_PAGE.to_string());
+
+    Ok((tag, url))
+}
+
 /// Where Homebrew puts the binaries a GUI app cannot find.
 ///
 /// An app opened from Finder inherits launchd's PATH — `/usr/bin:/bin:
@@ -894,6 +1012,46 @@ pub fn App() -> impl IntoElement {
     let progress = signal(0.0_f64);
     let hovering = signal(false);
     let quality = signal(Quality::Balanced);
+
+    let current_version = current_version();
+    let update = signal(UpdateCheck::Idle);
+
+    // Checking is manual, and one check runs at a time: `fetch` is awaited in
+    // a task the engine owns, so the signals it writes stay on the engine
+    // thread.
+    let check_now = {
+        let current = current_version.clone();
+        move || {
+            if matches!(update.get(), UpdateCheck::Checking) {
+                return;
+            }
+            update.set(UpdateCheck::Checking);
+            let current = current.clone();
+            spawn(async move {
+                let request = HttpRequest::get(RELEASES_FEED);
+                match fetch(request).await {
+                    Ok(response) if response.ok() => match parse_latest_release(&response.text()) {
+                        Ok((tag, url)) => {
+                            if is_newer(&tag, &current) {
+                                update.set(UpdateCheck::Available {
+                                    current,
+                                    latest: tag,
+                                    url,
+                                });
+                            } else {
+                                update.set(UpdateCheck::UpToDate { current });
+                            }
+                        }
+                        Err(message) => update.set(UpdateCheck::Failed { message }),
+                    },
+                    Ok(response) => update.set(UpdateCheck::Failed {
+                        message: format!("GitHub 返回 HTTP {}", response.status()),
+                    }),
+                    Err(message) => update.set(UpdateCheck::Failed { message }),
+                }
+            });
+        }
+    };
 
     // Signals belong to the engine thread's reactive graph, so worker threads
     // never write them: they send `Update`s and the engine thread applies them
@@ -1308,6 +1466,91 @@ pub fn App() -> impl IntoElement {
                                 )
                                 .child(view().flex_1())
                                 .child(button("选择文件", true, move || browse())),
+                        )
+                        // Version, and a manual check against GitHub's latest
+                        // release. The result shows in this same row.
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    text({
+                                        let version = current_version.clone();
+                                        move || format!("轻影 {version}")
+                                    })
+                                    .text_size(px(11.0))
+                                    .text_color(move || theme().muted_foreground),
+                                )
+                                .child(
+                                    view()
+                                        .rounded(px(6.0))
+                                        .px_2()
+                                        .py_1()
+                                        .active(|s| s.opacity(0.6))
+                                        .on_press(move || check_now())
+                                        .child(
+                                            text(move || match update.get() {
+                                                UpdateCheck::Idle => "检查更新".to_string(),
+                                                UpdateCheck::Checking => "检查中…".to_string(),
+                                                UpdateCheck::UpToDate { .. } => {
+                                                    "已是新版".to_string()
+                                                }
+                                                UpdateCheck::Available { latest, .. } => {
+                                                    format!("有新版本 {latest}")
+                                                }
+                                                UpdateCheck::Failed { .. } => {
+                                                    "检查失败，重试".to_string()
+                                                }
+                                            })
+                                            .text_size(px(11.0))
+                                            .text_color(move || match update.get() {
+                                                UpdateCheck::Available { .. } => theme().primary,
+                                                UpdateCheck::Failed { .. } => theme().destructive,
+                                                _ => theme().muted_foreground,
+                                            }),
+                                        ),
+                                )
+                                .child(view().flex_1())
+                                // The outcome, and the way to it.
+                                .child(when(
+                                    move || matches!(update.get(), UpdateCheck::Failed { .. }),
+                                    move || {
+                                        text(move || match update.get() {
+                                            UpdateCheck::Failed { message } => message,
+                                            _ => String::new(),
+                                        })
+                                        .text_size(px(10.0))
+                                        .text_color(move || theme().destructive)
+                                    },
+                                ))
+                                .child(when(
+                                    move || {
+                                        matches!(update.get(), UpdateCheck::Available { .. })
+                                    },
+                                    move || {
+                                        view()
+                                            .rounded(px(6.0))
+                                            .px_2()
+                                            .py_1()
+                                            .bg(move || theme().primary)
+                                            .active(|s| s.opacity(0.7))
+                                            .on_press(move || {
+                                                let url = match update.get() {
+                                                    UpdateCheck::Available { url, .. } => url,
+                                                    _ => RELEASES_PAGE.to_string(),
+                                                };
+                                                let _ = std::process::Command::new("open")
+                                                    .arg(url)
+                                                    .status();
+                                            })
+                                            .child(
+                                                text("去下载")
+                                                    .text_size(px(11.0))
+                                                    .text_color(move || theme().primary_foreground),
+                                            )
+                                    },
+                                )),
                         ),
                 ),
         )
