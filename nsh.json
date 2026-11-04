@@ -1,0 +1,9 @@
+{
+  "name": "轻影",
+  "id": "com.zvector.qingying",
+  "version": "1.0.0",
+  "build": 1,
+  "icon": "assets/icon.png",
+  "rust": ".",
+  "root": "App"
+}

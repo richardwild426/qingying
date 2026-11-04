@@ -1,0 +1,1314 @@
+//! 轻影 — one-click video compression that keeps the alpha channel.
+//!
+//! Drop a video (or pick one) and it re-encodes it with ffmpeg. Files that
+//! carry an alpha channel are encoded as HEVC with alpha through Apple's
+//! VideoToolbox (`-pix_fmt yuva420p -alpha_quality 1`), so the transparency
+//! survives; everything else becomes H.264 in an MP4.
+
+use std::io::{BufRead, BufReader, Read};
+use std::path::PathBuf;
+use std::process::Stdio;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::Duration;
+
+use nsh_base::{safe_area_view, theme};
+use nsh_core::ui::prelude::*;
+
+/// What a worker thread reports back to the engine thread.
+///
+/// Signals live in the engine thread's reactive graph, so the worker never
+/// touches them: it sends these and the engine thread applies them.
+enum Update {
+    /// The batch has been collected: how many files it will encode.
+    Scanned { total: usize },
+    /// One file is starting, `done` of `total` already behind us.
+    ItemStart {
+        total: usize,
+        done: usize,
+        name: String,
+    },
+    /// How far the current file is, and which codec it took.
+    ItemProgress { progress: f64, alpha: bool },
+    /// The current file ended, well or badly.
+    ItemDone { ok: bool, error: Option<String> },
+    /// Every file was tried.
+    BatchDone {
+        total: usize,
+        ok: usize,
+        saved_from: u64,
+        saved_to: u64,
+        last_out: Option<PathBuf>,
+        first_error: Option<String>,
+    },
+    /// There was nothing to encode.
+    Nothing { message: String },
+}
+
+/// What the app is currently doing.
+///
+/// There is only ever one kind of run: a batch of one or more files. A single
+/// file is just a batch whose total is 1, so the UI and the worker have one
+/// path to maintain instead of two.
+#[derive(Clone, PartialEq)]
+enum Job {
+    Idle,
+    /// Walking the input: how many files it found.
+    Scanning,
+    Running {
+        total: usize,
+        /// Files already finished, this one excluded.
+        done: usize,
+        name: String,
+        progress: f64,
+        alpha: bool,
+    },
+    /// Every file was tried; the tallies say how it went.
+    Finished {
+        total: usize,
+        ok: usize,
+        saved_from: u64,
+        saved_to: u64,
+        /// The last output, for "show in Finder".
+        last_out: Option<PathBuf>,
+        /// The first failure, when any file failed.
+        first_error: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Quality {
+    /// q:v 55 — smaller file.
+    Small,
+    /// q:v 50 + full-quality alpha.
+    Balanced,
+    /// q:v 40 — closest to source.
+    High,
+}
+
+impl Quality {
+    fn label(self) -> &'static str {
+        match self {
+            Quality::Small => "小体积",
+            Quality::Balanced => "均衡",
+            Quality::High => "高画质",
+        }
+    }
+
+    fn video_q(self) -> &'static str {
+        match self {
+            Quality::Small => "55",
+            Quality::Balanced => "50",
+            Quality::High => "40",
+        }
+    }
+
+    fn alpha_quality(self) -> &'static str {
+        match self {
+            Quality::Small => "0.85",
+            Quality::Balanced | Quality::High => "1",
+        }
+    }
+
+    fn crf(self) -> &'static str {
+        match self {
+            Quality::Small => "23",
+            Quality::Balanced => "18",
+            Quality::High => "15",
+        }
+    }
+}
+
+/// The app's UI set (`nsh.json` `"rust"`): what a TSX entry may import from
+/// `video-squeezer/native`.
+#[native_module("video-squeezer/native")]
+fn native(registry: &mut Registry) {
+    registry.register::<App>();
+}
+
+/// Append a line to `~/qingying-debug.log`.
+///
+/// A packaged NSH app runs under NSH's own runner, which never calls this
+/// crate's `main`, so `env_logger` is not initialised there and `log!` goes
+/// nowhere. Writing the file directly is the only reliable trace.
+fn trace(message: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let path = PathBuf::from(home).join("qingying-debug.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{message}");
+    }
+}
+
+fn path_from_uri(uri: &str) -> Option<PathBuf> {
+    trace(&format!("[uri] raw = {uri:?}"));
+
+    // Finder hands a drag over as a *file reference* URL — `file:///.file/
+    // id=1234` — not a path. `Url::to_file_path` would happily turn that into
+    // `/.file/id=1234`, which exists nowhere. AppKit resolves it properly, so
+    // ask `NSURL` first and keep the plain parse as a fallback.
+    #[cfg(target_os = "macos")]
+    if let Some(path) = macos::resolve_file_url(uri) {
+        trace(&format!("[uri] NSURL -> {}", path.display()));
+        return Some(path);
+    }
+
+    match url::Url::parse(uri) {
+        Ok(u) => {
+            let path = u.to_file_path().ok();
+            trace(&format!("[uri] url crate -> {path:?}"));
+            path
+        }
+        Err(e) => {
+            trace(&format!("[uri] parse failed: {e}"));
+            None
+        }
+    }
+}
+
+/// AppKit's own URL handling, for what `url` cannot express.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::path::PathBuf;
+
+    use nsh_platform_macos::objc2_foundation::{NSString, NSURL};
+
+    /// Turn a `file:` URL — reference form included — into a path.
+    pub fn resolve_file_url(uri: &str) -> Option<PathBuf> {
+        let text = NSString::from_str(uri);
+        let url = NSURL::URLWithString(&text)?;
+        // `filePathURL` resolves a file reference URL to its target; for a
+        // plain file URL it is the URL itself.
+        let file = url.filePathURL()?;
+        file.path().map(|p| PathBuf::from(p.to_string()))
+    }
+}
+
+fn fmt_bytes(bytes: u64) -> String {
+    let mb = bytes as f64 / 1024.0 / 1024.0;
+    if mb >= 1024.0 {
+        format!("{:.2} GB", mb / 1024.0)
+    } else if mb >= 1.0 {
+        format!("{:.1} MB", mb)
+    } else {
+        format!("{:.0} KB", bytes as f64 / 1024.0)
+    }
+}
+
+/// Probe the source: duration in seconds, and whether it has an alpha channel.
+fn probe(path: &PathBuf) -> Result<(f64, bool), String> {
+    // Duration via ffprobe.
+    let out = std::process::Command::new(find_tool("ffprobe"))
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("找不到 ffprobe：{e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("没有更多信息")
+            .trim()
+            .to_string();
+        trace(&format!(
+            "[probe] ffprobe failed for {}: {detail}",
+            path.display()
+        ));
+        if !path.exists() {
+            return Err("找不到这个文件，可能被移走了".into());
+        }
+        return Err(format!("ffprobe 读不出这个文件：{detail}"));
+    }
+    let duration: f64 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0.0);
+    if duration <= 0.0 {
+        trace(&format!(
+            "[probe] no duration for {}: {:?}",
+            path.display(),
+            String::from_utf8_lossy(&out.stdout)
+        ));
+        return Err("这个文件没有视频轨或时长为 0".into());
+    }
+
+    // Alpha: decode one frame as RGBA and look for non-opaque pixels.
+    let mut child = std::process::Command::new(find_tool("ffmpeg"))
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("找不到 ffmpeg：{e}"))?;
+
+    let mut frame = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        let mut stdout = stdout;
+        let _ = stdout.read_to_end(&mut frame);
+    }
+    let _ = child.wait();
+
+    if frame.len() < 4 {
+        return Err("解不出画面，可能不是视频".into());
+    }
+    // Sample every 97th pixel: enough to catch a transparent background.
+    let sampled = frame.iter().skip(3).step_by(4 * 97);
+    let mut total = 0usize;
+    let mut clear = 0usize;
+    for a in sampled {
+        total += 1;
+        if *a != 255 {
+            clear += 1;
+        }
+    }
+    let has_alpha = total > 0 && clear as f64 / total as f64 > 0.005;
+    Ok((duration, has_alpha))
+}
+
+/// Path to write the result to, next to the source.
+fn output_path(source: &PathBuf, alpha: bool) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output".into());
+    let ext = if alpha { "mov" } else { "mp4" };
+    source.with_file_name(format!("{stem}-squeezed.{ext}"))
+}
+
+/// How one file went.
+struct Encoded {
+    out: PathBuf,
+    from: u64,
+    to: u64,
+}
+
+/// Encode `source`, reporting progress through `on_progress`.
+///
+/// Returns the output's size and path, or a message to show the user.
+fn encode_one(
+    source: &PathBuf,
+    quality: Quality,
+    on_progress: &dyn Fn(f64, bool),
+) -> Result<Encoded, String> {
+    let (duration, has_alpha) = probe(source)?;
+
+    let out_path = output_path(source, has_alpha);
+    let from_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+    on_progress(0.0, has_alpha);
+
+    let mut cmd = std::process::Command::new(find_tool("ffmpeg"));
+    // ffmpeg looks up its own helpers relative to PATH; give it the usual
+    // directories rather than the stub PATH a Finder launch provides.
+    cmd.env("PATH", EXTRA_BIN_DIRS.join(":"));
+    cmd.arg("-y").arg("-i").arg(&source);
+
+    if has_alpha {
+        cmd.args([
+            "-c:v",
+            "hevc_videotoolbox",
+            "-pix_fmt",
+            "yuva420p",
+            "-alpha_quality",
+            quality.alpha_quality(),
+            "-tag:v",
+            "hvc1",
+            "-q:v",
+            quality.video_q(),
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+        ]);
+    } else {
+        cmd.args([
+            "-c:v",
+            "libx264",
+            "-crf",
+            quality.crf(),
+            "-preset",
+            "medium",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+        ]);
+    }
+    cmd.arg(&out_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("ffmpeg 启动失败：{e}"))?;
+
+    // ffmpeg reports progress on stderr as `... time=00:00:07.20 ...`.
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.wait();
+        return Err("读不到 ffmpeg 的进度输出".into());
+    };
+    let reader = BufReader::new(stderr);
+    let mut last_error = String::new();
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(pos) = line.find("time=") {
+            let rest = &line[pos + 5..];
+            let stamp: String = rest.chars().take_while(|c| *c != ' ').collect();
+            if let Some(seconds) = parse_timestamp(&stamp) {
+                on_progress((seconds / duration).clamp(0.0, 1.0), has_alpha);
+            }
+        } else if !line.trim().is_empty() {
+            last_error = line;
+        }
+    }
+    let _ = child.wait();
+
+    if !out_path.exists() {
+        return Err(if last_error.is_empty() {
+            "ffmpeg 没有产出文件，编码失败".into()
+        } else {
+            last_error
+        });
+    }
+    let to_size = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+    on_progress(1.0, has_alpha);
+    Ok(Encoded {
+        out: out_path,
+        from: from_size,
+        to: to_size,
+    })
+}
+
+/// Extensions this app will try to encode.
+const VIDEO_EXTS: &[&str] = &[
+    "mov", "mp4", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "ts", "mts", "m2ts",
+];
+
+fn is_video(path: &PathBuf) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let lower = e.to_ascii_lowercase();
+            VIDEO_EXTS.contains(&lower.as_str())
+        })
+        .unwrap_or(false)
+}
+
+/// Turn what was dropped or picked into the list of files to encode.
+///
+/// A dropped folder is walked one level deep — not recursively — so a folder
+/// of clips behaves as expected without silently pulling in a whole archive.
+/// Files this app already produced (`-squeezed`) are skipped, so a second run
+/// over the same folder does not encode its own output.
+fn collect_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for input in inputs {
+        if input.is_dir() {
+            let Ok(entries) = std::fs::read_dir(input) else {
+                trace(&format!("[scan] cannot read {}", input.display()));
+                continue;
+            };
+            let mut found: Vec<PathBuf> = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_file() && is_video(path))
+                .collect();
+            found.sort();
+            trace(&format!(
+                "[scan] {} -> {} videos",
+                input.display(),
+                found.len()
+            ));
+            files.extend(found);
+        } else if is_video(input) {
+            files.push(input.clone());
+        } else {
+            trace(&format!("[scan] skipped {}", input.display()));
+        }
+    }
+    files.retain(|path| {
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string());
+        !name.unwrap_or_default().contains("-squeezed")
+    });
+    // A folder and one of its files can both be dropped; encode each once.
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|path| seen.insert(path.clone()));
+    files
+}
+
+/// Encode every file in `inputs`, one after another, reporting to `tx`.
+///
+/// Runs on a worker thread; the engine thread drains `tx` with `pump`.
+fn encode_batch(inputs: Vec<PathBuf>, quality: Quality, tx: Sender<Update>) {
+    let files = collect_inputs(&inputs);
+    let total = files.len();
+    if total == 0 {
+        let _ = tx.send(Update::Nothing {
+            message: "这里没有可压缩的视频".into(),
+        });
+        return;
+    }
+    let _ = tx.send(Update::Scanned { total });
+
+    let mut ok = 0usize;
+    let mut saved_from = 0u64;
+    let mut saved_to = 0u64;
+    let mut last_out: Option<PathBuf> = None;
+    let mut first_error: Option<String> = None;
+
+    for (index, file) in files.iter().enumerate() {
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let _ = tx.send(Update::ItemStart {
+            total,
+            done: index,
+            name: name.clone(),
+        });
+
+        let sender = tx.clone();
+        let progress = move |pct: f64, alpha: bool| {
+            let _ = sender.send(Update::ItemProgress {
+                progress: pct,
+                alpha,
+            });
+        };
+
+        match encode_one(file, quality, &progress) {
+            Ok(done) => {
+                ok += 1;
+                saved_from += done.from;
+                saved_to += done.to;
+                last_out = Some(done.out);
+                let _ = tx.send(Update::ItemDone {
+                    ok: true,
+                    error: None,
+                });
+            }
+            Err(message) => {
+                trace(&format!("[encode] {name} failed: {message}"));
+                if first_error.is_none() {
+                    first_error = Some(format!("{name}：{message}"));
+                }
+                let _ = tx.send(Update::ItemDone {
+                    ok: false,
+                    error: Some(message),
+                });
+            }
+        }
+    }
+
+    let _ = tx.send(Update::BatchDone {
+        total,
+        ok,
+        saved_from,
+        saved_to,
+        last_out,
+        first_error,
+    });
+}
+
+/// Where Homebrew puts the binaries a GUI app cannot find.
+///
+/// An app opened from Finder inherits launchd's PATH — `/usr/bin:/bin:
+/// /usr/sbin:/sbin` — so `/opt/homebrew/bin` is not on it and `ffmpeg` is
+/// invisible, even though it works in a terminal. Every lookup tries these.
+const EXTRA_BIN_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/opt/local/bin",
+    "/usr/bin",
+    "/bin",
+];
+
+/// Locate a binary, falling back to the usual Homebrew locations.
+fn find_tool(name: &str) -> PathBuf {
+    for dir in EXTRA_BIN_DIRS {
+        let candidate = PathBuf::from(dir).join(name);
+        if candidate.is_file() {
+            trace(&format!("[tool] {name} -> {}", candidate.display()));
+            return candidate;
+        }
+    }
+    trace(&format!(
+        "[tool] {name} NOT FOUND in {EXTRA_BIN_DIRS:?}; PATH={:?}",
+        std::env::var("PATH")
+    ));
+    // Nothing on disk: let the OS try PATH, and let the spawn error say so.
+    PathBuf::from(name)
+}
+
+/// Shrink the window to the size this tool actually needs.
+///
+/// `nsh package`'s runner opens every app at 1200x800, and nothing in
+/// `nsh.json` changes that — a single form would float in a sea of white.
+/// The window is resized once, on the main queue, by AppKit itself.
+#[cfg(target_os = "macos")]
+fn fit_window(width: f64, height: f64) {
+    use nsh_platform_macos::objc2::MainThreadMarker;
+    use nsh_platform_macos::objc2_app_kit::NSApplication;
+    use nsh_platform_macos::objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    std::thread::spawn(move || {
+        // The window does not exist during the first frame's layout, so this
+        // retries on the main queue until one is there and can be resized.
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let (tx, rx) = std::sync::mpsc::channel();
+            dispatch2::DispatchQueue::main().exec_async(move || {
+                let done = (|| {
+                    let mtm = MainThreadMarker::new()?;
+                    let app = NSApplication::sharedApplication(mtm);
+                    // Not necessarily `mainWindow`: take the first real window
+                    // with a title, which is the app's own.
+                    let windows = app.windows();
+                    let window = (0..windows.count())
+                        .map(|i| windows.objectAtIndex(i))
+                        .find(|w| w.isVisible() && w.contentView().is_some())?;
+                    let screen = window.screen()?;
+                    let visible = screen.visibleFrame();
+                    let size = NSSize::new(width, height);
+                    let origin = NSPoint::new(
+                        visible.origin.x + (visible.size.width - width) / 2.0,
+                        visible.origin.y + (visible.size.height - height) / 2.0,
+                    );
+                    window.setContentSize(size);
+                    window.setFrame_display(NSRect::new(origin, size), true);
+                    window.center();
+                    Some(())
+                })()
+                .is_some();
+                let _ = tx.send(done);
+            });
+            if rx.recv().unwrap_or(false) {
+                break;
+            }
+        }
+    });
+}
+
+/// Show the file in Finder, selected.
+fn reveal(path: &PathBuf) {
+    let _ = std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .status();
+}
+
+/// Open the file in whatever app owns it.
+fn open_path(path: &PathBuf) {
+    let _ = std::process::Command::new("open").arg(path).status();
+}
+
+/// Apply worker updates to the UI signals, on the engine thread.
+///
+/// The worker runs one file at a time and reports each step; this folds those
+/// steps into the single `Job` the UI draws.
+fn pump(rx: Receiver<Update>, job: Signal<Job>, progress: Signal<f64>) {
+    let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
+    let live = signal(true);
+
+    set_interval(Duration::from_millis(80), move || {
+        if !live.get() {
+            return;
+        }
+        let mut finished = false;
+        loop {
+            let Ok(guard) = rx.try_borrow() else {
+                break;
+            };
+            let event = guard.try_recv();
+            drop(guard);
+
+            match event {
+                Ok(Update::Scanned { total }) => {
+                    progress.set(0.0);
+                    job.set(Job::Running {
+                        total,
+                        done: 0,
+                        name: String::new(),
+                        progress: 0.0,
+                        alpha: false,
+                    });
+                }
+                Ok(Update::ItemStart { total, done, name }) => {
+                    progress.set(0.0);
+                    job.set(Job::Running {
+                        total,
+                        done,
+                        name,
+                        progress: 0.0,
+                        alpha: false,
+                    });
+                }
+                Ok(Update::ItemProgress {
+                    progress: pct,
+                    alpha,
+                }) => {
+                    progress.set(pct);
+                    if let Job::Running {
+                        total,
+                        done,
+                        name,
+                        progress: _,
+                        alpha: was_alpha,
+                    } = job.get()
+                    {
+                        job.set(Job::Running {
+                            total,
+                            done,
+                            name,
+                            progress: pct,
+                            alpha: alpha || was_alpha,
+                        });
+                    }
+                }
+                Ok(Update::ItemDone { ok, error }) => {
+                    if !ok {
+                        if let Some(message) = error {
+                            trace(&format!("[pump] item failed: {message}"));
+                        }
+                    }
+                    // Keep the tallies on the running state so a failure
+                    // midway still leaves the numbers readable.
+                    if let Job::Running {
+                        total,
+                        done,
+                        name,
+                        alpha,
+                        ..
+                    } = job.get()
+                    {
+                        job.set(Job::Running {
+                            total,
+                            done: done + 1,
+                            name,
+                            progress: if ok { 1.0 } else { 0.0 },
+                            alpha,
+                        });
+                    }
+                }
+                Ok(Update::BatchDone {
+                    total,
+                    ok,
+                    saved_from,
+                    saved_to,
+                    last_out,
+                    first_error,
+                }) => {
+                    job.set(Job::Finished {
+                        total,
+                        ok,
+                        saved_from,
+                        saved_to,
+                        last_out,
+                        first_error,
+                    });
+                    finished = true;
+                }
+                Ok(Update::Nothing { message }) => {
+                    job.set(Job::Failed { message });
+                    finished = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    finished = true;
+                    break;
+                }
+            }
+            if finished {
+                break;
+            }
+        }
+        if finished {
+            live.set(false);
+        }
+    });
+}
+
+/// Drive a future to completion on the calling thread.
+///
+/// The dialogs are the only futures this app has, and they resolve on the main
+/// thread's run loop, so a full executor would be dead weight here.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct ThreadWaker(std::thread::Thread);
+    impl Wake for ThreadWaker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    let waker = Waker::from(Arc::new(ThreadWaker(std::thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => return value,
+            Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// `00:00:07.20` → 7.2
+fn parse_timestamp(stamp: &str) -> Option<f64> {
+    let mut parts = stamp.split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+/// A rounded, themed button.
+fn button(
+    label: impl Into<SharedString>,
+    primary: bool,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let label = label.into();
+    view()
+        .px_4()
+        .py_2()
+        .rounded(px(8.0))
+        .bg(move || {
+            if primary {
+                theme().primary
+            } else {
+                theme().muted
+            }
+        })
+        .active(|s| s.opacity(0.7))
+        .on_press(on_press)
+        .child(text(label).text_size(px(13.0)).text_color(move || {
+            if primary {
+                theme().primary_foreground
+            } else {
+                theme().foreground
+            }
+        }))
+}
+
+/// An icon a button may show, drawn with a glyph so the app stays dependency-free.
+#[derive(Clone, Copy, PartialEq)]
+enum Icon {
+    /// "Show in Finder": a magnifier over a folder, as macOS uses.
+    Reveal,
+    /// "Open": a play triangle.
+    Play,
+}
+
+impl Icon {
+    fn glyph(self) -> &'static str {
+        match self {
+            // Both are in every macOS system font, unlike the symbol-only
+            // codepoints that would fall back to a tofu box.
+            Icon::Reveal => "⌕",
+            Icon::Play => "▶",
+        }
+    }
+}
+
+/// A button with a leading icon, sized to a comfortable hit area.
+///
+/// A leading glyph makes the action readable at a glance, which is how
+/// macOS's own result views pair "Show in Finder" with a folder symbol.
+fn button_with_icon(
+    label: impl Into<SharedString>,
+    icon: Icon,
+    primary: bool,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    let label = label.into();
+    view()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .h(px(28.0))
+        .px_4()
+        .rounded(px(7.0))
+        .bg(move || {
+            if primary {
+                theme().primary
+            } else {
+                theme().background
+            }
+        })
+        .border(px(1.0))
+        .border_color(move || {
+            if primary {
+                theme().primary
+            } else {
+                theme().border
+            }
+        })
+        .active(|s| s.opacity(0.65))
+        .on_press(on_press)
+        .child(text(icon.glyph()).text_size(px(10.0)).text_color(move || {
+            if primary {
+                theme().primary_foreground
+            } else {
+                theme().muted_foreground
+            }
+        }))
+        .child(text(label).text_size(px(12.0)).text_color(move || {
+            if primary {
+                theme().primary_foreground
+            } else {
+                theme().foreground
+            }
+        }))
+}
+
+/// The application's root component.
+#[component]
+pub fn App() -> impl IntoElement {
+    // The runner's default 1200x800 is far more than this tool needs.
+    #[cfg(target_os = "macos")]
+    fit_window(560.0, 620.0);
+
+    let job = signal(Job::Idle);
+    let progress = signal(0.0_f64);
+    let hovering = signal(false);
+    let quality = signal(Quality::Balanced);
+
+    // Signals belong to the engine thread's reactive graph, so worker threads
+    // never write them: they send `Update`s and the engine thread applies them
+    // from a timer. This is what makes the progress bar and the picker safe.
+    let start = move |inputs: Vec<PathBuf>| {
+        for path in &inputs {
+            trace(&format!(
+                "[start] {} exists={} is_dir={} is_file={}",
+                path.display(),
+                path.exists(),
+                path.is_dir(),
+                path.is_file()
+            ));
+        }
+        if matches!(job.get(), Job::Running { .. } | Job::Scanning { .. }) {
+            trace("[start] ignored: a batch is already running");
+            return;
+        }
+        progress.set(0.0);
+        job.set(Job::Scanning);
+        let (tx, rx) = std::sync::mpsc::channel::<Update>();
+        let settings = quality.get();
+        std::thread::spawn(move || encode_batch(inputs, settings, tx));
+        pump(rx, job, progress);
+    };
+
+    // NSH runs press handlers on its engine thread, but AppKit builds an open
+    // panel only on the main thread: `FileDialog::pick_file` blocks and traps
+    // there. `AsyncFileDialog` hops to the main thread itself, so it runs on a
+    // worker and reports the choice over a channel.
+    let browse = move || {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
+        std::thread::spawn(move || {
+            let chosen = block_on(
+                rfd::AsyncFileDialog::new()
+                    .add_filter("视频", &VIDEO_EXTS.to_vec())
+                    .pick_files(),
+            );
+            let paths = chosen
+                .map(|handles| {
+                    handles
+                        .iter()
+                        .map(|handle| handle.path().to_path_buf())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let _ = tx.send(paths);
+        });
+
+        // Poll on the engine thread; the panel keeps the main thread's run loop.
+        let answer = std::rc::Rc::new(std::cell::RefCell::new(rx));
+        let waiting = signal(true);
+        set_interval(Duration::from_millis(100), move || {
+            if !waiting.get() {
+                return;
+            }
+            let Ok(guard) = answer.try_borrow() else {
+                return;
+            };
+            match guard.try_recv() {
+                Ok(paths) => {
+                    waiting.set(false);
+                    drop(guard);
+                    if !paths.is_empty() {
+                        start(paths);
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => waiting.set(false),
+            }
+        });
+    };
+
+    // One centred column, kept to a readable width: macOS apps do not stretch
+    // a single form across a wide window, and neither does this one.
+    view()
+        .flex_1()
+        .bg(move || theme().background)
+        .text_color(move || theme().foreground)
+        .child(
+            safe_area_view()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .p_8()
+                .child(
+                    // A comfortable measure that also shrinks with the window:
+                    // a fixed width wider than the space clips its right side.
+                    view()
+                        .w_full()
+                        .max_w(px(500.0))
+                        .gap_6()
+                        .child(
+                            // Header: title, then one line of explanation.
+                            view()
+                                .gap_1()
+                                .child(
+                                    text("轻影")
+                                        .text_size(px(22.0))
+                                        .text_color(move || theme().foreground),
+                                )
+                                .child(
+                                    text("拖入视频或整个文件夹，也可以选多个。带透明通道的会保留透明。")
+                                        .text_size(px(12.0))
+                                        .text_color(move || theme().muted_foreground),
+                                ),
+                        )
+                        // Drop zone: the whole target, with its own state text.
+                        .child(
+                            view()
+                                .w_full()
+                                // Fill what is left between the header and
+                                // the footer, but stop well before the window
+                                // turns into one huge empty target.
+                                .flex_1()
+                                .min_h(px(200.0))
+                                .max_h(px(340.0))
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .rounded(px(14.0))
+                                .border(px(1.5))
+                                .border_color(move || {
+                                    if hovering.get() {
+                                        theme().primary
+                                    } else {
+                                        theme().border
+                                    }
+                                })
+                                .bg(move || {
+                                    if hovering.get() {
+                                        theme().muted
+                                    } else {
+                                        theme().background
+                                    }
+                                })
+                                .on_file_drag_enter(move || hovering.set(true))
+                                .on_file_drag_leave(move || hovering.set(false))
+                                .on_file_drop(move |event: &FileDropEvent| {
+                                    hovering.set(false);
+                                    trace(&format!("[drop] uris = {:?}", event.uris));
+                                    let paths: Vec<PathBuf> = event
+                                        .uris
+                                        .iter()
+                                        .filter_map(|uri| path_from_uri(uri))
+                                        .collect();
+                                    if paths.is_empty() {
+                                        trace("[drop] no usable path in the drop");
+                                        job.set(Job::Failed {
+                                            message: "读不出拖进来的内容，试试点「选择文件」".into(),
+                                        });
+                                    } else {
+                                        start(paths);
+                                    }
+                                })
+                                .child(
+                                    text(move || match job.get() {
+                                        Job::Idle => "把视频拖到这里".to_string(),
+                                        Job::Scanning => "正在找视频…".to_string(),
+                                        Job::Running { total: _, name, .. } => name,
+                                        Job::Finished { .. } => "再拖一批".to_string(),
+                                        Job::Failed { .. } => "再试一次".to_string(),
+                                    })
+                                    .text_size(px(15.0))
+                                    .text_color(move || match job.get() {
+                                        Job::Idle => theme().muted_foreground,
+                                        Job::Failed { .. } => theme().destructive,
+                                        _ => theme().foreground,
+                                    }),
+                                )
+                                // While it runs: which file, how far, what codec.
+                                .child(when(
+                                    move || matches!(job.get(), Job::Running { .. }),
+                                    move || {
+                                        view()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                text(move || match job.get() {
+                                                    Job::Running {
+                                                        total,
+                                                        done,
+                                                        progress,
+                                                        alpha,
+                                                        ..
+                                                    } => {
+                                                        let codec = if alpha {
+                                                            "HEVC + 透明"
+                                                        } else {
+                                                            "H.264"
+                                                        };
+                                                        if total > 1 {
+                                                            format!(
+                                                                "{} / {}  ·  {:.0}%  ·  {}",
+                                                                done + 1,
+                                                                total,
+                                                                progress * 100.0,
+                                                                codec
+                                                            )
+                                                        } else {
+                                                            format!(
+                                                                "{:.0}%  ·  {}",
+                                                                progress * 100.0,
+                                                                codec
+                                                            )
+                                                        }
+                                                    }
+                                                    _ => String::new(),
+                                                })
+                                                .text_size(px(11.0))
+                                                .text_color(move || theme().muted_foreground),
+                                            )
+                                            .child(
+                                                view()
+                                                    .w(px(200.0))
+                                                    .h(px(4.0))
+                                                    .rounded(px(2.0))
+                                                    .bg(move || theme().border)
+                                                    .child(
+                                                        view()
+                                                            .h(px(4.0))
+                                                            .rounded(px(2.0))
+                                                            .w(move || {
+                                                                let fraction =
+                                                                    match job.get() {
+                                                                        Job::Running {
+                                                                            total,
+                                                                            done,
+                                                                            progress,
+                                                                            ..
+                                                                        } => {
+                                                                            (done as f64
+                                                                                + progress)
+                                                                                / total.max(1)
+                                                                                    as f64
+                                                                        }
+                                                                        _ => 0.0,
+                                                                    };
+                                                                relative(
+                                                                    fraction.clamp(0.0, 1.0)
+                                                                        as f32,
+                                                                )
+                                                            })
+                                                            .bg(move || theme().primary),
+                                                    ),
+                                            )
+                                    },
+                                )),
+                        )
+                        // Result: what came out, where it went, what to do next.
+                        .child(when(
+                            move || matches!(job.get(), Job::Finished { .. }),
+                            move || {
+                                let out = move || match job.get() {
+                                    Job::Finished { last_out, .. } => last_out,
+                                    _ => None,
+                                };
+                                view()
+                                    .w_full()
+                                    .p_4()
+                                    .gap_3()
+                                    .rounded(px(12.0))
+                                    .bg(move || theme().muted)
+                                    // The tallies: how many, and how much smaller.
+                                    .child(
+                                        text(move || match job.get() {
+                                            Job::Finished {
+                                                total,
+                                                ok,
+                                                saved_from,
+                                                saved_to,
+                                                ..
+                                            } => {
+                                                let saved = if saved_from > 0 {
+                                                    format!(
+                                                        "{}  →  {}    省了 {:.0}%",
+                                                        fmt_bytes(saved_from),
+                                                        fmt_bytes(saved_to),
+                                                        (1.0
+                                                            - saved_to as f64
+                                                                / saved_from.max(1) as f64)
+                                                            * 100.0
+                                                    )
+                                                } else {
+                                                    String::new()
+                                                };
+                                                if total > 1 {
+                                                    format!("{ok} / {total} 个文件   {saved}")
+                                                } else {
+                                                    saved
+                                                }
+                                            }
+                                            _ => String::new(),
+                                        })
+                                        .text_size(px(13.0))
+                                        .text_color(move || theme().foreground),
+                                    )
+                                    // Failures worth naming, without hiding the rest.
+                                    .child(when(
+                                        move || {
+                                            matches!(
+                                                job.get(),
+                                                Job::Finished {
+                                                    first_error: Some(_),
+                                                    ..
+                                                }
+                                            )
+                                        },
+                                        move || {
+                                            text(move || match job.get() {
+                                                Job::Finished {
+                                                    total,
+                                                    ok,
+                                                    first_error: Some(error),
+                                                    ..
+                                                } => {
+                                                    format!("{} 个失败：{error}", total - ok)
+                                                }
+                                                _ => String::new(),
+                                            })
+                                            .text_size(px(11.0))
+                                            .text_color(move || theme().destructive)
+                                        },
+                                    ))
+                                    .child(
+                                        view()
+                                            .flex_row()
+                                            .gap_2()
+                                            .child(button_with_icon(
+                                                "在访达中显示",
+                                                Icon::Reveal,
+                                                true,
+                                                move || {
+                                                    if let Some(p) = out() {
+                                                        reveal(&p)
+                                                    }
+                                                },
+                                            ))
+                                            .child(button_with_icon(
+                                                "打开",
+                                                Icon::Play,
+                                                false,
+                                                move || {
+                                                    if let Some(p) = out() {
+                                                        open_path(&p)
+                                                    }
+                                                },
+                                            )),
+                                    )
+                            },
+                        ))
+                        // The error, when there is one.
+                        .child(when(
+                            move || matches!(job.get(), Job::Failed { .. }),
+                            move || {
+                                text(move || match job.get() {
+                                    Job::Failed { message } => message,
+                                    _ => String::new(),
+                                })
+                                .text_size(px(12.0))
+                                .text_color(move || theme().destructive)
+                            },
+                        ))
+                        // Footer: quality on the left, the action on the right.
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    text("画质")
+                                        .text_size(px(12.0))
+                                        .text_color(move || theme().muted_foreground),
+                                )
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .gap_1()
+                                        .p_1()
+                                        .rounded(px(8.0))
+                                        .bg(move || theme().muted)
+                                        .children(
+                                            [Quality::Small, Quality::Balanced, Quality::High].map(
+                                                |q| {
+                                                    view()
+                                                        .px_3()
+                                                        .py_1()
+                                                        .rounded(px(6.0))
+                                                        .bg(move || {
+                                                            if quality.get() == q {
+                                                                theme().primary
+                                                            } else {
+                                                                theme().muted
+                                                            }
+                                                        })
+                                                        .active(|s| s.opacity(0.7))
+                                                        .on_press(move || quality.set(q))
+                                                        .child(
+                                                            text(q.label())
+                                                                .text_size(px(12.0))
+                                                                .text_color(move || {
+                                                                    if quality.get() == q {
+                                                                        theme().primary_foreground
+                                                                    } else {
+                                                                        theme().muted_foreground
+                                                                    }
+                                                                }),
+                                                        )
+                                                },
+                                            ),
+                                        ),
+                                )
+                                .child(view().flex_1())
+                                .child(button("选择文件", true, move || browse())),
+                        ),
+                ),
+        )
+}

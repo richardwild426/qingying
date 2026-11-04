@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0%" stop-color="#5AC8FA"/>
+      <stop offset="48%" stop-color="#2F9BEF"/>
+      <stop offset="100%" stop-color="#0B5FD0"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.30"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0.08"/>
+    </linearGradient>
+    <linearGradient id="frame" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#DCEBFB"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0.2" y1="0" x2="0.8" y2="1">
+      <stop offset="0%" stop-color="#1E6FD9" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#0B4FA8" stop-opacity="0.28"/>
+    </linearGradient>
+    <filter id="plateShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="26" stdDeviation="34" flood-color="#04224a" flood-opacity="0.42"/>
+    </filter>
+    <filter id="frameShadow" x="-35%" y="-35%" width="170%" height="170%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#03203f" flood-opacity="0.38"/>
+    </filter>
+    <filter id="arrowShadow" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="6" stdDeviation="9" flood-color="#04254d" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+
+  <!-- macOS squircle plate -->
+  <g filter="url(#plateShadow)">
+    <rect x="72" y="72" width="880" height="880" rx="196" fill="url(#bg)"/>
+  </g>
+  <rect x="72" y="72" width="880" height="880" rx="196" fill="url(#gloss)"/>
+  <rect x="78" y="78" width="868" height="868" rx="191" fill="none" stroke="#FFFFFF" stroke-opacity="0.32" stroke-width="5"/>
+
+  <!-- film frame, narrower than tall: already squeezed -->
+  <g filter="url(#frameShadow)">
+    <rect x="366" y="252" width="292" height="520" rx="46" fill="url(#frame)"/>
+  </g>
+  <rect x="404" y="292" width="216" height="440" rx="26" fill="url(#screen)"/>
+
+  <!-- play triangle, centred on the screen -->
+  <path d="M474 452 L474 572 L566 512 Z" fill="#FFFFFF" fill-opacity="0.95"/>
+  <path d="M474 452 L474 572 L566 512 Z" fill="#1565C0" fill-opacity="0.55"/>
+
+  <!-- sprocket holes -->
+  <g fill="#0B4FA8" fill-opacity="0.20">
+    <rect x="382" y="286" width="26" height="22" rx="7"/>
+    <rect x="382" y="350" width="26" height="22" rx="7"/>
+    <rect x="382" y="414" width="26" height="22" rx="7"/>
+    <rect x="382" y="478" width="26" height="22" rx="7"/>
+    <rect x="382" y="542" width="26" height="22" rx="7"/>
+    <rect x="382" y="606" width="26" height="22" rx="7"/>
+    <rect x="382" y="670" width="26" height="22" rx="7"/>
+    <rect x="632" y="286" width="26" height="22" rx="7"/>
+    <rect x="632" y="350" width="26" height="22" rx="7"/>
+    <rect x="632" y="414" width="26" height="22" rx="7"/>
+    <rect x="632" y="478" width="26" height="22" rx="7"/>
+    <rect x="632" y="542" width="26" height="22" rx="7"/>
+    <rect x="632" y="606" width="26" height="22" rx="7"/>
+    <rect x="632" y="670" width="26" height="22" rx="7"/>
+  </g>
+
+  <!-- squeeze chevrons, pressing inward -->
+  <g filter="url(#arrowShadow)">
+    <path d="M252 434 L338 512 L252 590 L252 534 L292 512 L252 490 Z" fill="#FFFFFF" fill-opacity="0.96"/>
+    <path d="M772 434 L686 512 L772 590 L772 534 L732 512 L772 490 Z" fill="#FFFFFF" fill-opacity="0.96"/>
+  </g>
+</svg>
