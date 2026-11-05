@@ -66,14 +66,14 @@ jobs:
       # refuses to build an app that asks for an older one. Keep these in step.
       - name: Install nsh
         env:
-          NSH_VERSION: v0.2.0
+          NSH_VERSION: v0.4.0
         run: |
           curl -fsSL https://nsh.dev/install.sh | sh
           # The installer links ~/.local/bin/nsh; later steps need it on PATH.
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/nsh" --version | tee /tmp/nsh-version
-          grep -q "0.2.0" /tmp/nsh-version || {
-            echo "::error::nsh is not 0.2.0; Cargo.toml asks for nsh-* 0.2.0 and a newer CLI refuses it."
+          grep -q "0.4.0" /tmp/nsh-version || {
+            echo "::error::nsh is not 0.4.0; Cargo.toml asks for nsh-* 0.4.0 and the CLI must match."
             exit 1
           }
 

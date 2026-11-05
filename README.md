@@ -117,9 +117,9 @@ DMG 由 `.github/make-dmg.sh` 制作：里面是 app 加一个指向 `/Applicati
 
 脚本在返回前会自己验证：镜像校验和、app 和链接都在、ad-hoc 签名有效、架构是 arm64。
 
-**版本必须与 `Cargo.toml` 里的 `nsh-*` 一致。** workflow 用 `NSH_VERSION: v0.2.0`
-固定 nsh 的版本，因为 CLR 会拒绝构建依赖旧版 crate 的项目；升级 `Cargo.toml` 时
-记得同步改这里。
+**版本必须与 `Cargo.toml` 里的 `nsh-*` 一致。** workflow 用 `NSH_VERSION: v0.4.0`
+固定 nsh 的版本：CLI 会拒绝构建依赖不同版本 crate 的项目，并且校验装到的版本，
+所以升级 `Cargo.toml` 时必须同步改这里。
 
 
 ## 检查更新

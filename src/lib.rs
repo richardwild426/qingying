@@ -11,9 +11,9 @@ use std::process::Stdio;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use nsh_base::{safe_area_view, theme};
+use nsh_base::theme;
 use nsh_core::platform::HttpRequest;
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 /// What a worker thread reports back to the engine thread.
 ///
@@ -1366,101 +1366,102 @@ pub fn App() -> impl IntoElement {
         .bg(move || theme().background)
         .text_color(move || theme().foreground)
         .child(
-            safe_area_view()
-                .flex_1()
-                .items_center()
-                .justify_center()
-                .p_8()
-                .child(
-                    // A comfortable measure that also shrinks with the window:
-                    // a fixed width wider than the space clips its right side.
-                    view()
-                        .w_full()
-                        .max_w(px(500.0))
-                        .gap_6()
-                        .child(
-                            // Header: title, then one line of explanation.
-                            view()
-                                .gap_1()
-                                .child(
-                                    text("轻影")
-                                        .text_size(px(22.0))
-                                        .text_color(move || theme().foreground),
+            // A plain view: this app runs on the desktop, where the safe area
+            // is zero, and `safe_area_view` is gone from NSH as of 0.4.
+            view().flex_1().items_center().justify_center().p_8().child(
+                // A comfortable measure that also shrinks with the window:
+                // a fixed width wider than the space clips its right side.
+                view()
+                    .w_full()
+                    .max_w(px(500.0))
+                    .gap_6()
+                    .child(
+                        // Header: title, then one line of explanation.
+                        view()
+                            .gap_1()
+                            .child(
+                                text("轻影")
+                                    .text_size(px(22.0))
+                                    .text_color(move || theme().foreground),
+                            )
+                            .child(
+                                text(
+                                    "拖入视频或整个文件夹，也可以选多个。带透明通道的会保留透明。",
                                 )
-                                .child(
-                                    text("拖入视频或整个文件夹，也可以选多个。带透明通道的会保留透明。")
-                                        .text_size(px(12.0))
-                                        .text_color(move || theme().muted_foreground),
-                                ),
-                        )
-                        // Drop zone: the whole target, with its own state text.
-                        .child(
-                            view()
-                                .w_full()
-                                // Fill what is left between the header and
-                                // the footer, but stop well before the window
-                                // turns into one huge empty target.
-                                .flex_1()
-                                .min_h(px(200.0))
-                                .max_h(px(340.0))
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .rounded(px(14.0))
-                                .border(px(1.5))
-                                .border_color(move || {
-                                    if hovering.get() {
-                                        theme().primary
-                                    } else {
-                                        theme().border
-                                    }
+                                .text_size(px(12.0))
+                                .text_color(move || theme().muted_foreground),
+                            ),
+                    )
+                    // Drop zone: the whole target, with its own state text.
+                    .child(
+                        view()
+                            .w_full()
+                            // Fill what is left between the header and
+                            // the footer, but stop well before the window
+                            // turns into one huge empty target.
+                            .flex_1()
+                            .min_h(px(200.0))
+                            .max_h(px(340.0))
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .rounded(px(14.0))
+                            .border(px(1.5))
+                            .border_color(move || {
+                                if hovering.get() {
+                                    theme().primary
+                                } else {
+                                    theme().border
+                                }
+                            })
+                            .bg(move || {
+                                if hovering.get() {
+                                    theme().muted
+                                } else {
+                                    theme().background
+                                }
+                            })
+                            .on_file_drag_enter(move || hovering.set(true))
+                            .on_file_drag_leave(move || hovering.set(false))
+                            .on_file_drop(move |event: &FileDropEvent| {
+                                hovering.set(false);
+                                trace(&format!("[drop] uris = {:?}", event.uris));
+                                let paths: Vec<PathBuf> = event
+                                    .uris
+                                    .iter()
+                                    .filter_map(|uri| path_from_uri(uri))
+                                    .collect();
+                                if paths.is_empty() {
+                                    trace("[drop] no usable path in the drop");
+                                    job.set(Job::Failed {
+                                        message: "读不出拖进来的内容，试试点「选择文件」".into(),
+                                    });
+                                } else {
+                                    start(paths);
+                                }
+                            })
+                            .child(
+                                text(move || match job.get() {
+                                    Job::Idle => "把视频拖到这里".to_string(),
+                                    Job::Scanning => "正在找视频…".to_string(),
+                                    Job::Running { total: _, name, .. } => name,
+                                    Job::Finished { .. } => "再拖一批".to_string(),
+                                    Job::Failed { .. } => "再试一次".to_string(),
                                 })
-                                .bg(move || {
-                                    if hovering.get() {
-                                        theme().muted
-                                    } else {
-                                        theme().background
-                                    }
-                                })
-                                .on_file_drag_enter(move || hovering.set(true))
-                                .on_file_drag_leave(move || hovering.set(false))
-                                .on_file_drop(move |event: &FileDropEvent| {
-                                    hovering.set(false);
-                                    trace(&format!("[drop] uris = {:?}", event.uris));
-                                    let paths: Vec<PathBuf> = event
-                                        .uris
-                                        .iter()
-                                        .filter_map(|uri| path_from_uri(uri))
-                                        .collect();
-                                    if paths.is_empty() {
-                                        trace("[drop] no usable path in the drop");
-                                        job.set(Job::Failed {
-                                            message: "读不出拖进来的内容，试试点「选择文件」".into(),
-                                        });
-                                    } else {
-                                        start(paths);
-                                    }
-                                })
-                                .child(
-                                    text(move || match job.get() {
-                                        Job::Idle => "把视频拖到这里".to_string(),
-                                        Job::Scanning => "正在找视频…".to_string(),
-                                        Job::Running { total: _, name, .. } => name,
-                                        Job::Finished { .. } => "再拖一批".to_string(),
-                                        Job::Failed { .. } => "再试一次".to_string(),
-                                    })
-                                    .text_size(px(15.0))
-                                    .text_color(move || match job.get() {
+                                .text_size(px(15.0))
+                                .text_color(move || {
+                                    match job.get() {
                                         Job::Idle => theme().muted_foreground,
                                         Job::Failed { .. } => theme().destructive,
                                         _ => theme().foreground,
-                                    }),
-                                )
-                                // While it runs: which file, how far, what codec.
-                                .child(when(
-                                    move || matches!(job.get(), Job::Running { .. }),
-                                    move || {
-                                        view()
+                                    }
+                                }),
+                            )
+                            // While it runs: which file, how far, what codec.
+                            .child(when(
+                                move || matches!(job.get(), Job::Running { .. }),
+                                move || {
+                                    view()
                                             .items_center()
                                             .gap_2()
                                             .child(
@@ -1532,308 +1533,298 @@ pub fn App() -> impl IntoElement {
                                                             .bg(move || theme().primary),
                                                     ),
                                             )
+                                },
+                            )),
+                    )
+                    // Result: what came out, where it went, what to do next.
+                    .child(when(
+                        move || matches!(job.get(), Job::Finished { .. }),
+                        move || {
+                            let out = move || match job.get() {
+                                Job::Finished { last_out, .. } => last_out,
+                                _ => None,
+                            };
+                            view()
+                                .w_full()
+                                .p_4()
+                                .gap_3()
+                                .rounded(px(12.0))
+                                .bg(move || theme().muted)
+                                // The tallies: how many, and how much smaller.
+                                .child(
+                                    text(move || match job.get() {
+                                        Job::Finished {
+                                            total,
+                                            ok,
+                                            saved_from,
+                                            saved_to,
+                                            ..
+                                        } => {
+                                            let saved = if saved_from > 0 {
+                                                format!(
+                                                    "{}  →  {}    省了 {:.0}%",
+                                                    fmt_bytes(saved_from),
+                                                    fmt_bytes(saved_to),
+                                                    (1.0 - saved_to as f64
+                                                        / saved_from.max(1) as f64)
+                                                        * 100.0
+                                                )
+                                            } else {
+                                                String::new()
+                                            };
+                                            if total > 1 {
+                                                format!("{ok} / {total} 个文件   {saved}")
+                                            } else {
+                                                saved
+                                            }
+                                        }
+                                        _ => String::new(),
+                                    })
+                                    .text_size(px(13.0))
+                                    .text_color(move || theme().foreground),
+                                )
+                                // Failures worth naming, without hiding the rest.
+                                .child(when(
+                                    move || {
+                                        matches!(
+                                            job.get(),
+                                            Job::Finished {
+                                                first_error: Some(_),
+                                                ..
+                                            }
+                                        )
                                     },
-                                )),
-                        )
-                        // Result: what came out, where it went, what to do next.
-                        .child(when(
-                            move || matches!(job.get(), Job::Finished { .. }),
-                            move || {
-                                let out = move || match job.get() {
-                                    Job::Finished { last_out, .. } => last_out,
-                                    _ => None,
-                                };
-                                view()
-                                    .w_full()
-                                    .p_4()
-                                    .gap_3()
-                                    .rounded(px(12.0))
-                                    .bg(move || theme().muted)
-                                    // The tallies: how many, and how much smaller.
-                                    .child(
+                                    move || {
                                         text(move || match job.get() {
                                             Job::Finished {
                                                 total,
                                                 ok,
-                                                saved_from,
-                                                saved_to,
+                                                first_error: Some(error),
                                                 ..
                                             } => {
-                                                let saved = if saved_from > 0 {
-                                                    format!(
-                                                        "{}  →  {}    省了 {:.0}%",
-                                                        fmt_bytes(saved_from),
-                                                        fmt_bytes(saved_to),
-                                                        (1.0
-                                                            - saved_to as f64
-                                                                / saved_from.max(1) as f64)
-                                                            * 100.0
-                                                    )
-                                                } else {
-                                                    String::new()
-                                                };
-                                                if total > 1 {
-                                                    format!("{ok} / {total} 个文件   {saved}")
-                                                } else {
-                                                    saved
-                                                }
+                                                format!("{} 个失败：{error}", total - ok)
                                             }
                                             _ => String::new(),
                                         })
-                                        .text_size(px(13.0))
-                                        .text_color(move || theme().foreground),
-                                    )
-                                    // Failures worth naming, without hiding the rest.
-                                    .child(when(
-                                        move || {
-                                            matches!(
-                                                job.get(),
-                                                Job::Finished {
-                                                    first_error: Some(_),
-                                                    ..
-                                                }
-                                            )
-                                        },
-                                        move || {
-                                            text(move || match job.get() {
-                                                Job::Finished {
-                                                    total,
-                                                    ok,
-                                                    first_error: Some(error),
-                                                    ..
-                                                } => {
-                                                    format!("{} 个失败：{error}", total - ok)
-                                                }
-                                                _ => String::new(),
-                                            })
-                                            .text_size(px(11.0))
-                                            .text_color(move || theme().destructive)
-                                        },
-                                    ))
-                                    .child(
-                                        view()
-                                            .flex_row()
-                                            .gap_2()
-                                            .child(button_with_icon(
-                                                "在访达中显示",
-                                                Icon::Reveal,
-                                                true,
-                                                move || {
-                                                    if let Some(p) = out() {
-                                                        reveal(&p)
-                                                    }
-                                                },
-                                            ))
-                                            .child(button_with_icon(
-                                                "打开",
-                                                Icon::Play,
-                                                false,
-                                                move || {
-                                                    if let Some(p) = out() {
-                                                        open_path(&p)
-                                                    }
-                                                },
-                                            )),
-                                    )
-                            },
-                        ))
-                        // The error, when there is one.
-                        .child(when(
-                            move || matches!(job.get(), Job::Failed { .. }),
-                            move || {
-                                text(move || match job.get() {
-                                    Job::Failed { message } => message,
-                                    _ => String::new(),
-                                })
-                                .text_size(px(12.0))
-                                .text_color(move || theme().destructive)
-                            },
-                        ))
-                        // Footer: quality on the left, the action on the right.
-                        .child(
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    text("画质")
-                                        .text_size(px(12.0))
-                                        .text_color(move || theme().muted_foreground),
-                                )
+                                        .text_size(px(11.0))
+                                        .text_color(move || theme().destructive)
+                                    },
+                                ))
                                 .child(
                                     view()
                                         .flex_row()
-                                        .gap_1()
-                                        .p_1()
-                                        .rounded(px(8.0))
-                                        .bg(move || theme().muted)
-                                        .children(
-                                            [Quality::Small, Quality::Balanced, Quality::High].map(
-                                                |q| {
-                                                    view()
-                                                        .px_3()
-                                                        .py_1()
-                                                        .rounded(px(6.0))
-                                                        .bg(move || {
-                                                            if quality.get() == q {
-                                                                theme().primary
-                                                            } else {
-                                                                theme().muted
-                                                            }
-                                                        })
-                                                        .active(|s| s.opacity(0.7))
-                                                        .on_press(move || quality.set(q))
-                                                        .child(
-                                                            text(q.label())
-                                                                .text_size(px(12.0))
-                                                                .text_color(move || {
-                                                                    if quality.get() == q {
-                                                                        theme().primary_foreground
-                                                                    } else {
-                                                                        theme().muted_foreground
-                                                                    }
-                                                                }),
-                                                        )
-                                                },
-                                            ),
-                                        ),
+                                        .gap_2()
+                                        .child(button_with_icon(
+                                            "在访达中显示",
+                                            Icon::Reveal,
+                                            true,
+                                            move || {
+                                                if let Some(p) = out() {
+                                                    reveal(&p)
+                                                }
+                                            },
+                                        ))
+                                        .child(button_with_icon(
+                                            "打开",
+                                            Icon::Play,
+                                            false,
+                                            move || {
+                                                if let Some(p) = out() {
+                                                    open_path(&p)
+                                                }
+                                            },
+                                        )),
                                 )
-                                .child(view().flex_1())
-                                .child(button("选择文件", true, move || browse())),
-                        )
-                        // Version, and a manual check against GitHub's latest
-                        // release. The result shows in this same row.
-                        .child(
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    text({
-                                        let version = current_version.clone();
-                                        move || format!("轻影 {version}")
-                                    })
-                                    .text_size(px(11.0))
+                        },
+                    ))
+                    // The error, when there is one.
+                    .child(when(
+                        move || matches!(job.get(), Job::Failed { .. }),
+                        move || {
+                            text(move || match job.get() {
+                                Job::Failed { message } => message,
+                                _ => String::new(),
+                            })
+                            .text_size(px(12.0))
+                            .text_color(move || theme().destructive)
+                        },
+                    ))
+                    // Footer: quality on the left, the action on the right.
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                text("画质")
+                                    .text_size(px(12.0))
                                     .text_color(move || theme().muted_foreground),
-                                )
-                                .child(
-                                    view()
-                                        .rounded(px(6.0))
-                                        .px_2()
-                                        .py_1()
-                                        .active(|s| s.opacity(0.6))
-                                        .on_press(move || check_now())
-                                        .child(
-                                            text(move || match update.get() {
-                                                UpdateCheck::Idle => "检查更新".to_string(),
-                                                UpdateCheck::Checking => "检查中…".to_string(),
-                                                UpdateCheck::UpToDate { .. } => {
-                                                    "已是新版".to_string()
-                                                }
-                                                UpdateCheck::Available { latest, .. } => {
-                                                    format!("有新版本 {latest}")
-                                                }
-                                                UpdateCheck::Downloading {
-                                                    received, ..
-                                                } => {
-                                                    let mb =
-                                                        received as f64 / 1048576.0;
-                                                    format!("下载中 {mb:.1} MB")
-                                                }
-                                                UpdateCheck::Installed { .. } => {
-                                                    "已更新".to_string()
-                                                }
-                                                UpdateCheck::Failed { .. } => {
-                                                    "检查失败，重试".to_string()
-                                                }
-                                            })
-                                            .text_size(px(11.0))
-                                            .text_color(move || match update.get() {
+                            )
+                            .child(
+                                view()
+                                    .flex_row()
+                                    .gap_1()
+                                    .p_1()
+                                    .rounded(px(8.0))
+                                    .bg(move || theme().muted)
+                                    .children(
+                                        [Quality::Small, Quality::Balanced, Quality::High].map(
+                                            |q| {
+                                                view()
+                                                    .px_3()
+                                                    .py_1()
+                                                    .rounded(px(6.0))
+                                                    .bg(move || {
+                                                        if quality.get() == q {
+                                                            theme().primary
+                                                        } else {
+                                                            theme().muted
+                                                        }
+                                                    })
+                                                    .active(|s| s.opacity(0.7))
+                                                    .on_press(move || quality.set(q))
+                                                    .child(
+                                                        text(q.label())
+                                                            .text_size(px(12.0))
+                                                            .text_color(move || {
+                                                                if quality.get() == q {
+                                                                    theme().primary_foreground
+                                                                } else {
+                                                                    theme().muted_foreground
+                                                                }
+                                                            }),
+                                                    )
+                                            },
+                                        ),
+                                    ),
+                            )
+                            .child(view().flex_1())
+                            .child(button("选择文件", true, move || browse())),
+                    )
+                    // Version, and a manual check against GitHub's latest
+                    // release. The result shows in this same row.
+                    .child(
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                text({
+                                    let version = current_version.clone();
+                                    move || format!("轻影 {version}")
+                                })
+                                .text_size(px(11.0))
+                                .text_color(move || theme().muted_foreground),
+                            )
+                            .child(
+                                view()
+                                    .rounded(px(6.0))
+                                    .px_2()
+                                    .py_1()
+                                    .active(|s| s.opacity(0.6))
+                                    .on_press(move || check_now())
+                                    .child(
+                                        text(move || match update.get() {
+                                            UpdateCheck::Idle => "检查更新".to_string(),
+                                            UpdateCheck::Checking => "检查中…".to_string(),
+                                            UpdateCheck::UpToDate { .. } => "已是新版".to_string(),
+                                            UpdateCheck::Available { latest, .. } => {
+                                                format!("有新版本 {latest}")
+                                            }
+                                            UpdateCheck::Downloading { received, .. } => {
+                                                let mb = received as f64 / 1048576.0;
+                                                format!("下载中 {mb:.1} MB")
+                                            }
+                                            UpdateCheck::Installed { .. } => "已更新".to_string(),
+                                            UpdateCheck::Failed { .. } => {
+                                                "检查失败，重试".to_string()
+                                            }
+                                        })
+                                        .text_size(px(11.0))
+                                        .text_color(
+                                            move || match update.get() {
                                                 UpdateCheck::Available { .. }
                                                 | UpdateCheck::Installed { .. } => theme().primary,
                                                 UpdateCheck::Failed { .. } => theme().destructive,
                                                 _ => theme().muted_foreground,
-                                            }),
+                                            },
                                         ),
-                                )
-                                .child(view().flex_1())
-                                // The outcome, and the way to it.
-                                .child(when(
-                                    move || matches!(update.get(), UpdateCheck::Failed { .. }),
-                                    move || {
-                                        text(move || match update.get() {
-                                            UpdateCheck::Failed { message } => message,
-                                            _ => String::new(),
-                                        })
-                                        .text_size(px(10.0))
-                                        .text_color(move || theme().destructive)
-                                    },
-                                ))
-                                // Update: download and install in place.
-                                .child(when(
-                                    move || {
-                                        matches!(update.get(), UpdateCheck::Available { .. })
-                                    },
-                                    move || {
-                                        view()
-                                            .rounded(px(6.0))
-                                            .px_2()
-                                            .py_1()
-                                            .bg(move || theme().primary)
-                                            .active(|s| s.opacity(0.7))
-                                            .on_press(move || install_now())
-                                            .child(
-                                                text("立即更新")
-                                                    .text_size(px(11.0))
-                                                    .text_color(move || theme().primary_foreground),
-                                            )
-                                    },
-                                ))
-                                // Installed: the new bundle is on disk, the
-                                // running process is still the old code.
-                                .child(when(
-                                    move || matches!(update.get(), UpdateCheck::Installed { .. }),
-                                    move || {
-                                        view()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_2()
-                                            .child(
-                                                text("已装好，重启生效")
-                                                    .text_size(px(10.0))
-                                                    .text_color(move || theme().muted_foreground),
-                                            )
-                                            .child(
-                                                view()
-                                                    .rounded(px(6.0))
-                                                    .px_2()
-                                                    .py_1()
-                                                    .bg(move || theme().primary)
-                                                    .active(|s| s.opacity(0.7))
-                                                    .on_press(move || {
-                                                        let exe = std::env::current_exe().ok();
-                                                        let bundle = bundle_name();
-                                                        // The new copy is in
-                                                        // /Applications already.
-                                                        let _ = std::process::Command::new("open")
-                                                            .arg(format!("/Applications/{bundle}"))
-                                                            .status();
-                                                        let _ = exe;
-                                                        // Quit so the fresh
-                                                        // bundle is what runs.
-                                                        std::process::exit(0);
-                                                    })
-                                                    .child(
-                                                        text("重启")
-                                                            .text_size(px(11.0))
-                                                            .text_color(move || {
-                                                                theme().primary_foreground
-                                                            }),
+                                    ),
+                            )
+                            .child(view().flex_1())
+                            // The outcome, and the way to it.
+                            .child(when(
+                                move || matches!(update.get(), UpdateCheck::Failed { .. }),
+                                move || {
+                                    text(move || match update.get() {
+                                        UpdateCheck::Failed { message } => message,
+                                        _ => String::new(),
+                                    })
+                                    .text_size(px(10.0))
+                                    .text_color(move || theme().destructive)
+                                },
+                            ))
+                            // Update: download and install in place.
+                            .child(when(
+                                move || matches!(update.get(), UpdateCheck::Available { .. }),
+                                move || {
+                                    view()
+                                        .rounded(px(6.0))
+                                        .px_2()
+                                        .py_1()
+                                        .bg(move || theme().primary)
+                                        .active(|s| s.opacity(0.7))
+                                        .on_press(move || install_now())
+                                        .child(
+                                            text("立即更新")
+                                                .text_size(px(11.0))
+                                                .text_color(move || theme().primary_foreground),
+                                        )
+                                },
+                            ))
+                            // Installed: the new bundle is on disk, the
+                            // running process is still the old code.
+                            .child(when(
+                                move || matches!(update.get(), UpdateCheck::Installed { .. }),
+                                move || {
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            text("已装好，重启生效")
+                                                .text_size(px(10.0))
+                                                .text_color(move || theme().muted_foreground),
+                                        )
+                                        .child(
+                                            view()
+                                                .rounded(px(6.0))
+                                                .px_2()
+                                                .py_1()
+                                                .bg(move || theme().primary)
+                                                .active(|s| s.opacity(0.7))
+                                                .on_press(move || {
+                                                    let exe = std::env::current_exe().ok();
+                                                    let bundle = bundle_name();
+                                                    // The new copy is in
+                                                    // /Applications already.
+                                                    let _ = std::process::Command::new("open")
+                                                        .arg(format!("/Applications/{bundle}"))
+                                                        .status();
+                                                    let _ = exe;
+                                                    // Quit so the fresh
+                                                    // bundle is what runs.
+                                                    std::process::exit(0);
+                                                })
+                                                .child(
+                                                    text("重启").text_size(px(11.0)).text_color(
+                                                        move || theme().primary_foreground,
                                                     ),
-                                            )
-                                    },
-                                )),
-                        ),
-                ),
+                                                ),
+                                        )
+                                },
+                            )),
+                    ),
+            ),
         )
 }
