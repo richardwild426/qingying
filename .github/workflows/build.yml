@@ -83,17 +83,34 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # The tests encode real files, so they need the same ffmpeg the app
+      # does. Homebrew's cache is kept between runs: ffmpeg has a long
+      # dependency tail and a cold install costs minutes.
+      - name: Cache Homebrew
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: ${{ runner.os }}-brew-ffmpeg
+
+      - name: Install ffmpeg
+        run: |
+          brew install ffmpeg
+          ffmpeg -version | head -1
+
       # The waiting-list tests drop real files on the window, so they need a
-      # couple of tiny clips. Generated here rather than committed: a binary
-      # fixture in the repo is one more thing to keep in step with the code.
+      # couple of clips long enough to be interrupted. Generated here rather
+      # than committed: a binary fixture in the repo is one more thing to
+      # keep in step with the code.
       - name: Make the test clips
         run: |
           mkdir -p .test-fixtures
           for i in 1 2 3; do
             ffmpeg -y -v error \
               -f lavfi -i "testsrc=size=1280x720:rate=30:duration=12" \
-              -c:v libx264 -pix_fmt yuv420p ".test-fixtures/clip${i}.mp4"
+              -c:v libx264 -preset ultrafast -pix_fmt yuv420p \
+              ".test-fixtures/clip${i}.mp4"
           done
+          ls -lh .test-fixtures
 
       - name: Run the tests
         run: nsh test
