@@ -27,9 +27,12 @@ env:
 jobs:
   build:
     name: Package (arm64)
-    # macos-14 and later run on Apple Silicon; macos-13 is Intel and would
-    # produce an x86_64 binary.
-    runs-on: macos-14
+    # macos-15 and later run on Apple Silicon; macos-13 and the `-intel`
+    # labels are Intel and would produce an x86_64 binary. macos-14 was
+    # retired by GitHub and now fails to resolve at all ("The configuration
+    # 'macos-14-arm64-us-default' is not supported"), which is why this is
+    # pinned to the oldest label that still exists rather than the newest.
+    runs-on: macos-15
     timeout-minutes: 40
 
     steps:
