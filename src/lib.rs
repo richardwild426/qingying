@@ -754,6 +754,12 @@ enum UpdateCheck {
         /// The release asset this platform installs.
         asset: String,
     },
+    /// The feed listed a newer tag, but its DMG is not published yet. CI can
+    /// take minutes after the tag is pushed, and `releases.atom` does not
+    /// wait for it.
+    Preparing {
+        latest: String,
+    },
     /// The DMG is downloading; `received` of `total` bytes, 0 if unknown.
     Downloading {
         latest: String,
@@ -862,6 +868,9 @@ async fn download_to(url: &str, dest: &PathBuf) -> Result<u64, String> {
     let response = fetch(HttpRequest::get(url))
         .await
         .map_err(|message| format!("下载失败：{message}"))?;
+    if response.status() == 404 {
+        return Err("安装包还没上传完成，稍后再试".into());
+    }
     if !response.ok() {
         return Err(format!("下载失败：HTTP {}", response.status()));
     }
@@ -1412,12 +1421,38 @@ pub fn App() -> impl IntoElement {
                             match parse_latest_release(&response.text()) {
                                 Ok((tag, url)) => {
                                     if is_newer(&tag, &current) {
-                                        update.set(UpdateCheck::Available {
-                                            current,
-                                            latest: tag,
-                                            url,
-                                            asset: ASSET_NAME.to_string(),
-                                        });
+                                        // GitHub's releases.atom also lists
+                                        // tags with no published Release yet.
+                                        // A tag can show up minutes before CI
+                                        // uploads the DMG, so verify the asset
+                                        // before offering an update that would
+                                        // only 404 when pressed.
+                                        let head = HttpRequest::new("HEAD", asset_url(&tag));
+                                        match fetch(head).await {
+                                            Ok(response) if response.ok() => {
+                                                update.set(UpdateCheck::Available {
+                                                    current,
+                                                    latest: tag,
+                                                    url,
+                                                    asset: ASSET_NAME.to_string(),
+                                                });
+                                            }
+                                            Ok(response) if response.status() == 404 => {
+                                                trace(&format!(
+                                                    "[update] {tag} has no downloadable asset yet"
+                                                ));
+                                                update.set(UpdateCheck::Preparing { latest: tag });
+                                            }
+                                            Ok(response) => update.set(UpdateCheck::Failed {
+                                                message: format!(
+                                                    "检查安装包失败：HTTP {}",
+                                                    response.status()
+                                                ),
+                                            }),
+                                            Err(message) => update.set(UpdateCheck::Failed {
+                                                message: format!("检查安装包失败：{message}"),
+                                            }),
+                                        }
                                     } else {
                                         update.set(UpdateCheck::UpToDate { current });
                                     }
@@ -2223,6 +2258,9 @@ pub fn App() -> impl IntoElement {
                                             UpdateCheck::Available { latest, .. } => {
                                                 format!("有新版本 {latest}")
                                             }
+                                            UpdateCheck::Preparing { latest } => {
+                                                format!("{latest} 准备中")
+                                            }
                                             // `fetch` hands back the whole
                                             // body, so there is no running
                                             // byte count to show. Before
@@ -2258,14 +2296,27 @@ pub fn App() -> impl IntoElement {
                             .child(view().flex_1())
                             // The outcome, and the way to it.
                             .child(when(
-                                move || matches!(update.get(), UpdateCheck::Failed { .. }),
+                                move || {
+                                    matches!(
+                                        update.get(),
+                                        UpdateCheck::Failed { .. } | UpdateCheck::Preparing { .. }
+                                    )
+                                },
                                 move || {
                                     text(move || match update.get() {
                                         UpdateCheck::Failed { message } => message,
+                                        UpdateCheck::Preparing { .. } => {
+                                            "安装包还没上传，稍后点这里重试".to_string()
+                                        }
                                         _ => String::new(),
                                     })
                                     .text_size(px(10.0))
-                                    .text_color(move || theme().destructive)
+                                    .text_color(move || {
+                                        match update.get() {
+                                            UpdateCheck::Failed { .. } => theme().destructive,
+                                            _ => theme().muted_foreground,
+                                        }
+                                    })
                                 },
                             ))
                             // Update: download and install in place.

@@ -170,8 +170,13 @@ CI 用 `--app-version` 覆盖），所以显示的和 Finder 里看到的始终�
 `releases.atom`——纯 XML、无需认证、没有速率限制。解析是手写的（整个应用只读这一处
 XML），取第一个 `<entry>` 的 `<title>` 作为 tag。
 
-网络访问在 `nsh.json` 的 `capabilities.network.hosts` 里只授权了 `github.com`，
-其余主机一律拒绝。
+**但 feed 也列出只有 tag、还没有 Release 的条目**：CI 打完 tag 到上传 DMG 之间有几分钟
+空窗，这时固定下载地址会是 404。所以检查更新会先对
+`releases/download/<tag>/QingYing-macos-arm64.dmg` 发一个 `HEAD`；只有安装包确实存在
+才显示「有新版本」，否则显示「准备中」，不给出点了必然失败的「立即更新」。
+
+网络访问在 `nsh.json` 的 `capabilities.network.hosts` 里只授权了 `github.com` 和
+`release-assets.githubusercontent.com`（下载的跳转目标），其余主机一律拒绝。
 
 ## 应用内更新
 

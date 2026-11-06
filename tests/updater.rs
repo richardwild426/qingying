@@ -38,13 +38,14 @@ fn response(status: u16, body: &[u8]) -> StubResponse {
     r
 }
 
-/// An app whose network answers the feed and the asset, and which records
-/// every request it made.
-fn app() -> (Headless, Arc<StubNetwork>) {
+/// An app whose network answers the feed, the asset HEAD check and the
+/// download, and which records every request it made.
+fn app_with_asset(head_status: u16, get_status: u16) -> (Headless, Arc<StubNetwork>) {
     let network = Arc::new(StubNetwork::new([
         (format!("GET {FEED}"), response(200, ATOM.as_bytes())),
+        (format!("HEAD {ASSET}"), response(head_status, b"")),
         // Not a real DMG: what matters is that the app asks for it.
-        (format!("GET {ASSET}"), response(200, b"not a dmg")),
+        (format!("GET {ASSET}"), response(get_status, b"not a dmg")),
     ]));
     let mut config = EngineConfig::new(Root::of::<nsh_app_video_squeezer::App>());
     config.network = Some(network.clone());
@@ -54,16 +55,31 @@ fn app() -> (Headless, Arc<StubNetwork>) {
     (app, network)
 }
 
+fn app() -> (Headless, Arc<StubNetwork>) {
+    app_with_asset(200, 200)
+}
+
+fn asked(network: &StubNetwork) -> Vec<String> {
+    network
+        .requests()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url))
+        .collect()
+}
+
 #[test]
-fn checking_for_updates_fetches_the_release_feed() {
+fn checking_for_updates_fetches_the_feed_and_verifies_the_asset() {
     let (mut app, network) = app();
     app.press("text:检查更新")
         .expect("the check button is there");
     app.wait_for("text:/有新版本/")
         .expect("a newer release is found");
 
-    let asked: Vec<String> = network.requests().iter().map(|r| r.url.clone()).collect();
-    assert_eq!(asked, [FEED], "the check asks GitHub's feed, and only it");
+    assert_eq!(
+        asked(&network),
+        [format!("GET {FEED}"), format!("HEAD {ASSET}")],
+        "the check asks for the feed, then verifies the DMG is published"
+    );
 }
 
 /// The regression: pressing 立即更新 must reach the network. Before the fix
@@ -79,15 +95,18 @@ fn starting_the_download_asks_for_the_asset() {
         .expect("the update button is there");
     // The download runs on a worker thread; the request must show up.
     app.wait_until("the asset is requested", Duration::from_secs(10), |_| {
-        network.requests().len() >= 2
+        network.requests().len() >= 3
     })
     .expect("the asset is requested, not silently skipped");
 
-    let asked: Vec<String> = network.requests().iter().map(|r| r.url.clone()).collect();
     assert_eq!(
-        asked,
-        [FEED, ASSET],
-        "the feed, then the release asset it named"
+        asked(&network),
+        [
+            format!("GET {FEED}"),
+            format!("HEAD {ASSET}"),
+            format!("GET {ASSET}")
+        ],
+        "the feed, the asset check, then the release asset it named"
     );
 }
 
@@ -111,4 +130,41 @@ fn the_download_leaves_the_zero_it_used_to_sit_on() {
         "still at zero after the download: {}",
         app.screen().texts().join(" | ")
     );
+}
+
+/// `releases.atom` lists a tag as soon as it is pushed, minutes before CI
+/// uploads the DMG. Offering that as an update only produces a 404.
+#[test]
+fn a_tag_without_a_published_asset_is_not_offered_as_an_update() {
+    let (mut app, network) = app_with_asset(404, 200);
+    app.press("text:检查更新").expect("check");
+    app.wait_for("text:/准备中/")
+        .expect("the tag is still being prepared");
+
+    let texts = app.screen().texts().join(" | ");
+    assert!(!texts.contains("有新版本"), "offered a 404: {texts}");
+    assert!(!texts.contains("立即更新"), "offered a 404: {texts}");
+    assert!(
+        texts.contains("安装包还没上传"),
+        "no explanation for the wait: {texts}"
+    );
+    assert_eq!(
+        asked(&network),
+        [format!("GET {FEED}"), format!("HEAD {ASSET}")],
+        "the check stops at the missing asset"
+    );
+}
+
+/// Even with the HEAD check, the asset can disappear between check and
+/// download; the user should see why, not a bare HTTP code.
+#[test]
+fn a_download_that_404s_explains_the_missing_asset() {
+    let (mut app, _network) = app_with_asset(200, 404);
+    app.press("text:检查更新").expect("check");
+    app.wait_for("text:/有新版本/").expect("found");
+
+    app.press("text:立即更新").expect("update");
+    app.wait_for("text:/安装包还没上传完成/")
+        .expect("the 404 is explained");
+    assert!(!app.shows("HTTP 404"), "showed a bare status code");
 }
