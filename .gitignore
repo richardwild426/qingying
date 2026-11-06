@@ -5,3 +5,8 @@ target/
 *.zip
 *.dmg
 *.app/
+.alma-snapshots
+
+# The clips the waiting-list tests drop on the window (the CI step makes
+# them), and the outputs the tests encode from them.
+.test-fixtures/

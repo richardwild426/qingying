@@ -8,10 +8,13 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::time::Duration;
 
 use nsh_base::theme;
+use nsh_base::tooltip;
 use nsh_core::platform::HttpRequest;
 use nsh_core::prelude::*;
 
@@ -20,8 +23,9 @@ use nsh_core::prelude::*;
 /// Signals live in the engine thread's reactive graph, so the worker never
 /// touches them: it sends these and the engine thread applies them.
 enum Update {
-    /// The batch has been collected: how many files it will encode.
-    Scanned { total: usize },
+    /// The dropped or picked inputs have been walked: the files they hold,
+    /// for the user to confirm before anything is encoded.
+    Scanned { files: Vec<PathBuf> },
     /// One file is starting, `done` of `total` already behind us.
     ItemStart {
         total: usize,
@@ -40,6 +44,9 @@ enum Update {
         saved_to: u64,
         last_out: Option<PathBuf>,
         first_error: Option<String>,
+        /// The user asked to stop: the tallies cover what finished, and the
+        /// file in flight was abandoned.
+        stopped: bool,
     },
     /// There was nothing to encode.
     Nothing { message: String },
@@ -53,8 +60,14 @@ enum Update {
 #[derive(Clone, PartialEq)]
 enum Job {
     Idle,
-    /// Walking the input: how many files it found.
+    /// Walking the input: which files it holds is not known yet.
     Scanning,
+    /// The files that were dropped or picked, waiting for the user to start.
+    /// Nothing is encoded until they say so, so this is where a file they
+    /// changed their mind about is taken back out.
+    Ready {
+        files: Vec<PathBuf>,
+    },
     Running {
         total: usize,
         /// Files already finished, this one excluded.
@@ -73,6 +86,8 @@ enum Job {
         last_out: Option<PathBuf>,
         /// The first failure, when any file failed.
         first_error: Option<String>,
+        /// The user stopped it before every file was tried.
+        stopped: bool,
     },
     Failed {
         message: String,
@@ -118,6 +133,31 @@ impl Quality {
             Quality::Small => "23",
             Quality::Balanced => "18",
             Quality::High => "15",
+        }
+    }
+
+    /// What the preset means, in the user's terms rather than ffmpeg's.
+    ///
+    /// The numbers alone ("q:v 50") say nothing to someone choosing a file
+    /// size, so the hint leads with what changes and mentions the flag it
+    /// maps to only as an aside.
+    fn hint(self) -> &'static str {
+        match self {
+            Quality::Small => {
+                "体积最小，适合发微信、传网盘。\n\
+                 透明边缘可能有轻微毛边。\n\
+                 无透明 CRF 23 / 带透明 q:v 55"
+            }
+            Quality::Balanced => {
+                "默认档，肉眼基本看不出差别。\n\
+                 透明通道保持完整。\n\
+                 无透明 CRF 18 / 带透明 q:v 50"
+            }
+            Quality::High => {
+                "最接近原片，适合还要再剪的素材。\n\
+                 文件也最大。\n\
+                 无透明 CRF 15 / 带透明 q:v 40"
+            }
         }
     }
 }
@@ -303,15 +343,58 @@ struct Encoded {
     to: u64,
 }
 
+/// The error `encode_one` returns when the user stopped the run.
+///
+/// Not a failure: the batch asked for it, so it is never shown as one.
+const CANCELLED: &str = "__cancelled__";
+
+/// The flag a running batch watches for the user's stop.
+///
+/// It lives in a signal so the button that sets it and the worker thread
+/// that reads it share one flag. Comparing by pointer is what makes it a
+/// signal value at all: the same flag is the same cancel, and reading it
+/// must not look like a change.
+#[derive(Clone)]
+struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Ask the batch to stop after the file it is on.
+    fn stop(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn stopped(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl PartialEq for Cancel {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// Encode `source`, reporting progress through `on_progress`.
 ///
 /// Returns the output's size and path, or a message to show the user.
 fn encode_one(
     source: &PathBuf,
     quality: Quality,
+    cancel: &AtomicBool,
     on_progress: &dyn Fn(f64, bool),
 ) -> Result<Encoded, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
     let (duration, has_alpha) = probe(source)?;
+    // Probing decodes a frame; a stop during it must not start an encode.
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
 
     let out_path = output_path(source, has_alpha);
     let from_size = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
@@ -369,20 +452,53 @@ fn encode_one(
         let _ = child.wait();
         return Err("读不到 ffmpeg 的进度输出".into());
     };
-    let reader = BufReader::new(stderr);
-    let mut last_error = String::new();
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(pos) = line.find("time=") {
-            let rest = &line[pos + 5..];
-            let stamp: String = rest.chars().take_while(|c| *c != ' ').collect();
-            if let Some(seconds) = parse_timestamp(&stamp) {
-                on_progress((seconds / duration).clamp(0.0, 1.0), has_alpha);
+    // ffmpeg's stderr is read on its own thread so this one can keep looking
+    // at the cancel flag. Reading it inline would block on `read` until the
+    // next line arrives, and a stalled ffmpeg would then ignore the user's
+    // stop for as long as it stalled.
+    let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if lines_tx.send(line).is_err() {
+                break;
             }
-        } else if !line.trim().is_empty() {
-            last_error = line;
+        }
+    });
+
+    let mut last_error = String::new();
+    let mut stopped = false;
+    loop {
+        match lines_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if let Some(pos) = line.find("time=") {
+                    let rest = &line[pos + 5..];
+                    let stamp: String = rest.chars().take_while(|c| *c != ' ').collect();
+                    if let Some(seconds) = parse_timestamp(&stamp) {
+                        on_progress((seconds / duration).clamp(0.0, 1.0), has_alpha);
+                    }
+                } else if !line.trim().is_empty() {
+                    last_error = line;
+                }
+            }
+            // Nothing said for 100 ms: the only reason to act is the user.
+            Err(RecvTimeoutError::Timeout) => {
+                if cancel.load(Ordering::Relaxed) {
+                    stopped = true;
+                    let _ = child.kill();
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = child.wait();
+
+    // A killed ffmpeg leaves the half-written output behind; it is not a
+    // result anyone asked for, so it goes.
+    if stopped {
+        let _ = std::fs::remove_file(&out_path);
+        return Err(CANCELLED.into());
+    }
 
     if !out_path.exists() {
         return Err(if last_error.is_empty() {
@@ -457,27 +573,42 @@ fn collect_inputs(inputs: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Encode every file in `inputs`, one after another, reporting to `tx`.
+/// Walk `inputs` and report the files they hold.
 ///
-/// Runs on a worker thread; the engine thread drains `tx` with `pump`.
-fn encode_batch(inputs: Vec<PathBuf>, quality: Quality, tx: Sender<Update>) {
+/// Runs on a worker thread: a dropped folder can hold thousands of entries,
+/// and the engine thread must keep drawing while it is read.
+fn scan_batch(inputs: Vec<PathBuf>, tx: Sender<Update>) {
     let files = collect_inputs(&inputs);
-    let total = files.len();
-    if total == 0 {
+    if files.is_empty() {
         let _ = tx.send(Update::Nothing {
             message: "这里没有可压缩的视频".into(),
         });
         return;
     }
-    let _ = tx.send(Update::Scanned { total });
+    let _ = tx.send(Update::Scanned { files });
+}
 
+/// Encode `files`, one after another, reporting to `tx`.
+///
+/// Runs on a worker thread; the engine thread drains `tx` with `pump`.
+/// `cancel` is the user's stop: the file in flight is killed and the rest
+/// are left alone.
+fn encode_batch(files: Vec<PathBuf>, quality: Quality, cancel: Cancel, tx: Sender<Update>) {
+    let total = files.len();
     let mut ok = 0usize;
     let mut saved_from = 0u64;
     let mut saved_to = 0u64;
     let mut last_out: Option<PathBuf> = None;
     let mut first_error: Option<String> = None;
 
+    // Between files, before each one: a stop the last file honoured leaves
+    // the rest untouched rather than starting one more.
+    let mut stopped = false;
     for (index, file) in files.iter().enumerate() {
+        if cancel.stopped() {
+            stopped = true;
+            break;
+        }
         let name = file
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -496,7 +627,7 @@ fn encode_batch(inputs: Vec<PathBuf>, quality: Quality, tx: Sender<Update>) {
             });
         };
 
-        match encode_one(file, quality, &progress) {
+        match encode_one(file, quality, &cancel.0, &progress) {
             Ok(done) => {
                 ok += 1;
                 saved_from += done.from;
@@ -506,6 +637,12 @@ fn encode_batch(inputs: Vec<PathBuf>, quality: Quality, tx: Sender<Update>) {
                     ok: true,
                     error: None,
                 });
+            }
+            // The user's stop, not a failure: no error to report, and the
+            // batch ends here.
+            Err(message) if message == CANCELLED => {
+                stopped = true;
+                break;
             }
             Err(message) => {
                 trace(&format!("[encode] {name} failed: {message}"));
@@ -527,6 +664,7 @@ fn encode_batch(inputs: Vec<PathBuf>, quality: Quality, tx: Sender<Update>) {
         saved_to,
         last_out,
         first_error,
+        stopped,
     });
 }
 
@@ -886,125 +1024,149 @@ fn open_path(path: &PathBuf) {
 ///
 /// The worker runs one file at a time and reports each step; this folds those
 /// steps into the single `Job` the UI draws.
-fn pump(rx: Receiver<Update>, job: Signal<Job>, progress: Signal<f64>) {
+fn pump(
+    rx: Receiver<Update>,
+    job: Signal<Job>,
+    progress: Signal<f64>,
+    carry: Signal<Vec<PathBuf>>,
+    pending: Signal<Vec<PathBuf>>,
+    owner: Owner,
+) {
     let rx = std::rc::Rc::new(std::cell::RefCell::new(rx));
-    let live = signal(true);
 
-    set_interval(Duration::from_millis(80), move || {
-        if !live.get() {
-            return;
-        }
-        let mut finished = false;
-        loop {
-            let Ok(guard) = rx.try_borrow() else {
-                break;
-            };
-            let event = guard.try_recv();
-            drop(guard);
+    // Everything here — the liveness flag and the timer that reads it — is
+    // made under the app's owner, not the caller's. `pump` is called from a
+    // press handler, and whatever a handler makes belongs to the region it
+    // ran in: a timer and flag started while the waiting list was showing
+    // died with that list, and the run's progress then never reached the
+    // window.
+    owner.run(move || {
+        let live = signal(true);
+        set_interval(Duration::from_millis(80), move || {
+            if !live.get() {
+                return;
+            }
+            let mut finished = false;
+            loop {
+                let Ok(guard) = rx.try_borrow() else {
+                    break;
+                };
+                let event = guard.try_recv();
+                drop(guard);
 
-            match event {
-                Ok(Update::Scanned { total }) => {
-                    progress.set(0.0);
-                    job.set(Job::Running {
-                        total,
-                        done: 0,
-                        name: String::new(),
-                        progress: 0.0,
-                        alpha: false,
-                    });
-                }
-                Ok(Update::ItemStart { total, done, name }) => {
-                    progress.set(0.0);
-                    job.set(Job::Running {
-                        total,
-                        done,
-                        name,
-                        progress: 0.0,
-                        alpha: false,
-                    });
-                }
-                Ok(Update::ItemProgress {
-                    progress: pct,
-                    alpha,
-                }) => {
-                    progress.set(pct);
-                    if let Job::Running {
-                        total,
-                        done,
-                        name,
-                        progress: _,
-                        alpha: was_alpha,
-                    } = job.get()
-                    {
+                match event {
+                    // The inputs are known but nothing has been encoded: this is
+                    // the moment the user confirms the list or trims it.
+                    Ok(Update::Scanned { files }) => {
+                        progress.set(0.0);
+                        // A second drop adds to a list that is already waiting,
+                        // each file once.
+                        let mut all = carry.get();
+                        for file in files {
+                            if !all.contains(&file) {
+                                all.push(file);
+                            }
+                        }
+                        carry.set(Vec::new());
+                        pending.set(all.clone());
+                        job.set(Job::Ready { files: all });
+                        finished = true;
+                    }
+                    Ok(Update::ItemStart { total, done, name }) => {
+                        progress.set(0.0);
                         job.set(Job::Running {
                             total,
                             done,
                             name,
-                            progress: pct,
-                            alpha: alpha || was_alpha,
+                            progress: 0.0,
+                            alpha: false,
                         });
                     }
-                }
-                Ok(Update::ItemDone { ok, error }) => {
-                    if !ok {
-                        if let Some(message) = error {
-                            trace(&format!("[pump] item failed: {message}"));
+                    Ok(Update::ItemProgress {
+                        progress: pct,
+                        alpha,
+                    }) => {
+                        progress.set(pct);
+                        if let Job::Running {
+                            total,
+                            done,
+                            name,
+                            progress: _,
+                            alpha: was_alpha,
+                        } = job.get()
+                        {
+                            job.set(Job::Running {
+                                total,
+                                done,
+                                name,
+                                progress: pct,
+                                alpha: alpha || was_alpha,
+                            });
                         }
                     }
-                    // Keep the tallies on the running state so a failure
-                    // midway still leaves the numbers readable.
-                    if let Job::Running {
-                        total,
-                        done,
-                        name,
-                        alpha,
-                        ..
-                    } = job.get()
-                    {
-                        job.set(Job::Running {
+                    Ok(Update::ItemDone { ok, error }) => {
+                        if !ok {
+                            if let Some(message) = error {
+                                trace(&format!("[pump] item failed: {message}"));
+                            }
+                        }
+                        // Keep the tallies on the running state so a failure
+                        // midway still leaves the numbers readable.
+                        if let Job::Running {
                             total,
-                            done: done + 1,
+                            done,
                             name,
-                            progress: if ok { 1.0 } else { 0.0 },
                             alpha,
-                        });
+                            ..
+                        } = job.get()
+                        {
+                            job.set(Job::Running {
+                                total,
+                                done: done + 1,
+                                name,
+                                progress: if ok { 1.0 } else { 0.0 },
+                                alpha,
+                            });
+                        }
                     }
-                }
-                Ok(Update::BatchDone {
-                    total,
-                    ok,
-                    saved_from,
-                    saved_to,
-                    last_out,
-                    first_error,
-                }) => {
-                    job.set(Job::Finished {
+                    Ok(Update::BatchDone {
                         total,
                         ok,
                         saved_from,
                         saved_to,
                         last_out,
                         first_error,
-                    });
-                    finished = true;
+                        stopped,
+                    }) => {
+                        job.set(Job::Finished {
+                            total,
+                            ok,
+                            saved_from,
+                            saved_to,
+                            last_out,
+                            first_error,
+                            stopped,
+                        });
+                        finished = true;
+                    }
+                    Ok(Update::Nothing { message }) => {
+                        job.set(Job::Failed { message });
+                        finished = true;
+                    }
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
                 }
-                Ok(Update::Nothing { message }) => {
-                    job.set(Job::Failed { message });
-                    finished = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    finished = true;
+                if finished {
                     break;
                 }
             }
             if finished {
-                break;
+                live.set(false);
             }
-        }
-        if finished {
-            live.set(false);
-        }
+        });
     });
 }
 
@@ -1287,9 +1449,30 @@ pub fn App() -> impl IntoElement {
         }
     };
 
+    // The stop flag of the run in progress, if any. A signal so the button
+    // that sets it and the worker that reads it share one flag, and so that
+    // `start` stays `Copy` (a closure capturing an `Rc` would not be, and it
+    // is used from more than one handler).
+    // The owner of the app's own layout, captured once. What a press handler
+    // makes belongs to the region it ran in, which is not what a batch's
+    // timer should die with — see `pump`.
+    let app_owner = Owner::current();
+
+    let cancel = signal(None::<Cancel>);
+    // What a scan is adding to: the files already waiting, which it adds to
+    // rather than replaces.
+    let carry = signal(Vec::<PathBuf>::new());
+    // The waiting list itself, on its own so the rows read one plain signal.
+    // `Job::Ready` mirrors it for the states that only ask "is anything
+    // waiting"; `pending` is what the list draws.
+    let pending = signal(Vec::<PathBuf>::new());
+
     // Signals belong to the engine thread's reactive graph, so worker threads
     // never write them: they send `Update`s and the engine thread applies them
     // from a timer. This is what makes the progress bar and the picker safe.
+    //
+    // Dropping or picking only *collects*: the files land in `Job::Ready` and
+    // wait. Encoding starts when the user says so.
     let start = move |inputs: Vec<PathBuf>| {
         for path in &inputs {
             trace(&format!(
@@ -1300,16 +1483,72 @@ pub fn App() -> impl IntoElement {
                 path.is_file()
             ));
         }
+        // A waiting list takes more files (dropping a second folder adds to
+        // it); a run in progress does not, since its total is already fixed.
         if matches!(job.get(), Job::Running { .. } | Job::Scanning { .. }) {
             trace("[start] ignored: a batch is already running");
             return;
         }
+        // Files already waiting stay in the list: this scan adds to them.
+        carry.set(pending.get());
         progress.set(0.0);
         job.set(Job::Scanning);
+        cancel.set(None);
+        let (tx, rx) = std::sync::mpsc::channel::<Update>();
+        std::thread::spawn(move || scan_batch(inputs, tx));
+        pump(rx, job, progress, carry, pending, app_owner);
+    };
+
+    // Turn the waiting list into a run.
+    let begin = move || {
+        let files = pending.get();
+        if files.is_empty() {
+            return;
+        }
+        let flag = Cancel::new();
+        cancel.set(Some(flag.clone()));
+        progress.set(0.0);
+        job.set(Job::Running {
+            total: files.len(),
+            done: 0,
+            name: String::new(),
+            progress: 0.0,
+            alpha: false,
+        });
         let (tx, rx) = std::sync::mpsc::channel::<Update>();
         let settings = quality.get();
-        std::thread::spawn(move || encode_batch(inputs, settings, tx));
-        pump(rx, job, progress);
+        // The list has become the run: nothing is left waiting.
+        pending.set(Vec::new());
+        carry.set(Vec::new());
+        std::thread::spawn(move || encode_batch(files, settings, flag, tx));
+        pump(rx, job, progress, carry, pending, app_owner);
+    };
+
+    // Ask the run in progress to stop. The worker kills ffmpeg and ends the
+    // batch; the UI keeps showing progress until it reports back.
+    let stop = move || {
+        if let Some(flag) = cancel.get() {
+            flag.stop();
+            trace("[stop] asked the batch to stop");
+        }
+    };
+
+    // Take one file back out of the waiting list.
+    let remove = move |path: PathBuf| {
+        let kept: Vec<PathBuf> = pending.get().into_iter().filter(|p| *p != path).collect();
+        pending.set(kept.clone());
+        // The last one gone: there is nothing left to start, so the window
+        // goes back to its empty state instead of showing an empty list.
+        job.set(if kept.is_empty() {
+            Job::Idle
+        } else {
+            Job::Ready { files: kept }
+        });
+    };
+
+    let clear = move || {
+        pending.set(Vec::new());
+        job.set(Job::Idle);
     };
 
     // NSH runs press handlers on its engine thread, but AppKit builds an open
@@ -1359,6 +1598,50 @@ pub fn App() -> impl IntoElement {
         });
     };
 
+    // The waiting list's rows, made here rather than inside the branch that
+    // shows them: a region is rebuilt every time its condition flips, and an
+    // `each` rebuilt that way stops following the signal it lists — the rows
+    // would then keep files that were taken out. Made once, it follows
+    // `pending` for the life of the window.
+    let list = view().gap_1().child(each(
+        pending,
+        |path| path.clone(),
+        move |path: ReadSignal<PathBuf>, _| {
+            let path = path.get();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            view()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded(px(6.0))
+                .bg(move || theme().muted)
+                .child(
+                    text(name)
+                        .text_size(px(12.0))
+                        .text_color(move || theme().foreground),
+                )
+                .child(view().flex_1())
+                .child(
+                    view()
+                        .px_2()
+                        .py_1()
+                        .rounded(px(4.0))
+                        .active(|s| s.opacity(0.6))
+                        .on_press(move || remove(path.clone()))
+                        .child(
+                            text("移除")
+                                .text_size(px(11.0))
+                                .text_color(move || theme().muted_foreground),
+                        ),
+                )
+        },
+    ));
+
     // One centred column, kept to a readable width: macOS apps do not stretch
     // a single form across a wide window, and neither does this one.
     view()
@@ -1395,6 +1678,7 @@ pub fn App() -> impl IntoElement {
                     // Drop zone: the whole target, with its own state text.
                     .child(
                         view()
+                            .test_id("dropzone")
                             .w_full()
                             // Fill what is left between the header and
                             // the footer, but stop well before the window
@@ -1444,6 +1728,9 @@ pub fn App() -> impl IntoElement {
                                 text(move || match job.get() {
                                     Job::Idle => "把视频拖到这里".to_string(),
                                     Job::Scanning => "正在找视频…".to_string(),
+                                    Job::Ready { files } => {
+                                        format!("{} 个文件待压缩", files.len())
+                                    }
                                     Job::Running { total: _, name, .. } => name,
                                     Job::Finished { .. } => "再拖一批".to_string(),
                                     Job::Failed { .. } => "再试一次".to_string(),
@@ -1451,7 +1738,7 @@ pub fn App() -> impl IntoElement {
                                 .text_size(px(15.0))
                                 .text_color(move || {
                                     match job.get() {
-                                        Job::Idle => theme().muted_foreground,
+                                        Job::Idle | Job::Ready { .. } => theme().muted_foreground,
                                         Job::Failed { .. } => theme().destructive,
                                         _ => theme().foreground,
                                     }
@@ -1533,9 +1820,52 @@ pub fn App() -> impl IntoElement {
                                                             .bg(move || theme().primary),
                                                     ),
                                             )
+                                            // Stop: the file in flight is
+                                            // killed and the rest are left
+                                            // as they are.
+                                            .child(
+                                                view()
+                                                    .px_3()
+                                                    .py_1()
+                                                    .rounded(px(6.0))
+                                                    .border(px(1.0))
+                                                    .border_color(move || theme().border)
+                                                    .active(|s| s.opacity(0.6))
+                                                    .on_press(move || stop())
+                                                    .child(
+                                                        text("中断")
+                                                            .text_size(px(11.0))
+                                                            .text_color(move || {
+                                                                theme().foreground
+                                                            }),
+                                                    ),
+                                            )
                                 },
                             )),
                     )
+                    // The waiting list: what will be encoded, one row each,
+                    // so a file the user no longer wants can come back out
+                    // before anything is spent on it.
+                    .child(when(
+                        move || matches!(job.get(), Job::Ready { .. }),
+                        move || {
+                            view()
+                                .w_full()
+                                .gap_2()
+                                // A long list scrolls instead of pushing the
+                                // buttons out of the window.
+                                .child(scroll().max_h(px(180.0)).child(list.clone()))
+                                // Start it, or drop the whole list.
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(button("开始压缩", true, move || begin()))
+                                        .child(button("清空", false, move || clear())),
+                                )
+                        },
+                    ))
                     // Result: what came out, where it went, what to do next.
                     .child(when(
                         move || matches!(job.get(), Job::Finished { .. }),
@@ -1558,6 +1888,7 @@ pub fn App() -> impl IntoElement {
                                             ok,
                                             saved_from,
                                             saved_to,
+                                            stopped,
                                             ..
                                         } => {
                                             let saved = if saved_from > 0 {
@@ -1572,10 +1903,21 @@ pub fn App() -> impl IntoElement {
                                             } else {
                                                 String::new()
                                             };
-                                            if total > 1 {
-                                                format!("{ok} / {total} 个文件   {saved}")
+                                            // A stopped run says so, and
+                                            // names what did get through
+                                            // rather than pretending the
+                                            // whole batch was tried.
+                                            let head = if stopped {
+                                                format!("已中断 · 完成 {ok} / {total}")
+                                            } else if total > 1 {
+                                                format!("{ok} / {total} 个文件")
                                             } else {
-                                                saved
+                                                String::new()
+                                            };
+                                            match (head.is_empty(), saved.is_empty()) {
+                                                (true, _) => saved,
+                                                (false, true) => head,
+                                                (false, false) => format!("{head}   {saved}"),
                                             }
                                         }
                                         _ => String::new(),
@@ -1670,7 +2012,16 @@ pub fn App() -> impl IntoElement {
                                     .children(
                                         [Quality::Small, Quality::Balanced, Quality::High].map(
                                             |q| {
+                                                // Each preset says what it
+                                                // costs and buys, so the
+                                                // three are a choice instead
+                                                // of three words.
                                                 view()
+                                                    .test_id(match q {
+                                                        Quality::Small => "quality-small",
+                                                        Quality::Balanced => "quality-balanced",
+                                                        Quality::High => "quality-high",
+                                                    })
                                                     .px_3()
                                                     .py_1()
                                                     .rounded(px(6.0))
@@ -1682,6 +2033,23 @@ pub fn App() -> impl IntoElement {
                                                         }
                                                     })
                                                     .active(|s| s.opacity(0.7))
+                                                    .tooltip(
+                                                        tooltip().delay(350.0).child(
+                                                            view()
+                                                                .w(px(210.0))
+                                                                .p_2()
+                                                                .rounded(px(6.0))
+                                                                .bg(move || theme().popover)
+                                                                .child(
+                                                                    text(q.hint())
+                                                                        .text_size(px(11.0))
+                                                                        .text_color(move || {
+                                                                            theme()
+                                                                                .popover_foreground
+                                                                        }),
+                                                                ),
+                                                        ),
+                                                    )
                                                     .on_press(move || quality.set(q))
                                                     .child(
                                                         text(q.label())
@@ -1699,7 +2067,26 @@ pub fn App() -> impl IntoElement {
                                     ),
                             )
                             .child(view().flex_1())
-                            .child(button("选择文件", true, move || browse())),
+                            // Built here rather than with `button()`: its
+                            // label follows the state (a waiting list is
+                            // added to, an empty window is filled).
+                            .child(
+                                view()
+                                    .px_4()
+                                    .py_2()
+                                    .rounded(px(8.0))
+                                    .bg(move || theme().primary)
+                                    .active(|s| s.opacity(0.7))
+                                    .on_press(move || browse())
+                                    .child(
+                                        text(move || match job.get() {
+                                            Job::Ready { .. } => "添加文件".to_string(),
+                                            _ => "选择文件".to_string(),
+                                        })
+                                        .text_size(px(13.0))
+                                        .text_color(move || theme().primary_foreground),
+                                    ),
+                            ),
                     )
                     // Version, and a manual check against GitHub's latest
                     // release. The result shows in this same row.
