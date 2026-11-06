@@ -6,7 +6,7 @@
 //! survives; everything else becomes H.264 in an MP4.
 
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -818,20 +818,58 @@ fn asset_url(tag: &str) -> String {
     format!("https://github.com/richardwild426/qingying/releases/download/{tag}/{ASSET_NAME}")
 }
 
+/// The `.app` bundle an executable path lives in.
+fn bundle_from_exe(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .find(|path| path.extension().is_some_and(|ext| ext == "app"))
+        .map(|path| path.to_path_buf())
+}
+
+/// Where this running app's bundle is on disk, wherever it was installed.
+fn app_bundle_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| bundle_from_exe(&exe))
+}
+
 /// This app's bundle name, e.g. `轻影.app`.
 ///
 /// Taken from the running executable's path rather than a constant: the bundle
 /// is what gets replaced, and the image holds a copy with the same name.
 fn bundle_name() -> String {
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            exe.ancestors()
-                .find(|p| p.extension().is_some_and(|e| e == "app"))
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().to_string())
+    app_bundle_path()
+        .and_then(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
         })
         .unwrap_or_else(|| "轻影.app".to_string())
+}
+
+/// Ask macOS to open a *new* instance of `bundle`.
+///
+/// `open` without `-n` only activates the instance that is already running;
+/// after an in-app update that instance is about to exit, so no window would
+/// come back. The absolute program path avoids a Finder launch's stub PATH.
+fn relaunch_command(bundle: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("/usr/bin/open");
+    command
+        .arg("-n")
+        .arg(bundle)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Start the freshly installed bundle from its real path.
+fn relaunch_app() -> Result<(), String> {
+    let bundle = app_bundle_path().ok_or("找不到当前应用位置")?;
+    let status = relaunch_command(&bundle)
+        .status()
+        .map_err(|e| format!("启动新版本失败：{e}"))?;
+    if !status.success() {
+        return Err(format!("启动新版本失败：open 退出码 {:?}", status.code()));
+    }
+    Ok(())
 }
 
 /// Where the downloaded image is written before mounting.
@@ -914,14 +952,8 @@ fn install_from_dmg(dmg: &PathBuf, app_name: &str) -> Result<(), String> {
             return Err(format!("镜像里没有 {app_name}"));
         }
 
-        // Where this app lives now: /Applications/轻影.app.
-        let exe = std::env::current_exe().map_err(|e| format!("找不到自身位置：{e}"))?;
-        let target = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .ok_or("自身位置不对")?
-            .to_path_buf();
+        // Where this app lives now, wherever it was installed.
+        let target = app_bundle_path().ok_or("找不到当前应用位置")?;
         trace(&format!(
             "[update] {} -> {}",
             source.display(),
@@ -1785,9 +1817,38 @@ pub fn App() -> impl IntoElement {
     // One centred column, kept to a readable width: macOS apps do not stretch
     // a single form across a wide window, and neither does this one.
     view()
+        .test_id("app-root")
+        .size_full()
         .flex_1()
         .bg(move || theme().background)
         .text_color(move || theme().foreground)
+        .border(px(2.0))
+        .border_color(move || {
+            if hovering.get() {
+                theme().primary
+            } else {
+                theme().background
+            }
+        })
+        .on_file_drag_enter(move || hovering.set(true))
+        .on_file_drag_leave(move || hovering.set(false))
+        .on_file_drop(move |event: &FileDropEvent| {
+            hovering.set(false);
+            trace(&format!("[drop] uris = {:?}", event.uris));
+            let paths: Vec<PathBuf> = event
+                .uris
+                .iter()
+                .filter_map(|uri| path_from_uri(uri))
+                .collect();
+            if paths.is_empty() {
+                trace("[drop] no usable path in the drop");
+                job.set(Job::Failed {
+                    message: "读不出拖进来的内容，试试点「选择文件」".into(),
+                });
+            } else {
+                start(paths);
+            }
+        })
         .child(
             // A plain view: this app runs on the desktop, where the safe area
             // is zero, and `safe_area_view` is gone from NSH as of 0.4.
@@ -1809,7 +1870,7 @@ pub fn App() -> impl IntoElement {
                             )
                             .child(
                                 text(
-                                    "拖入视频或整个文件夹，也可以选多个。带透明通道的会保留透明。",
+                                    "拖入视频或整个文件夹，窗口任意位置都能放；带透明通道的会保留透明。",
                                 )
                                 .text_size(px(12.0))
                                 .text_color(move || theme().muted_foreground),
@@ -1845,28 +1906,9 @@ pub fn App() -> impl IntoElement {
                                     theme().background
                                 }
                             })
-                            .on_file_drag_enter(move || hovering.set(true))
-                            .on_file_drag_leave(move || hovering.set(false))
-                            .on_file_drop(move |event: &FileDropEvent| {
-                                hovering.set(false);
-                                trace(&format!("[drop] uris = {:?}", event.uris));
-                                let paths: Vec<PathBuf> = event
-                                    .uris
-                                    .iter()
-                                    .filter_map(|uri| path_from_uri(uri))
-                                    .collect();
-                                if paths.is_empty() {
-                                    trace("[drop] no usable path in the drop");
-                                    job.set(Job::Failed {
-                                        message: "读不出拖进来的内容，试试点「选择文件」".into(),
-                                    });
-                                } else {
-                                    start(paths);
-                                }
-                            })
                             .child(
                                 text(move || match job.get() {
-                                    Job::Idle => "把视频拖到这里".to_string(),
+                                    Job::Idle => "拖到窗口任意位置".to_string(),
                                     Job::Scanning => "正在找视频…".to_string(),
                                     Job::Ready { files } => {
                                         format!("{} 个文件待压缩", files.len())
@@ -2359,17 +2401,21 @@ pub fn App() -> impl IntoElement {
                                                 .bg(move || theme().primary)
                                                 .active(|s| s.opacity(0.7))
                                                 .on_press(move || {
-                                                    let exe = std::env::current_exe().ok();
-                                                    let bundle = bundle_name();
-                                                    // The new copy is in
-                                                    // /Applications already.
-                                                    let _ = std::process::Command::new("open")
-                                                        .arg(format!("/Applications/{bundle}"))
-                                                        .status();
-                                                    let _ = exe;
-                                                    // Quit so the fresh
-                                                    // bundle is what runs.
-                                                    std::process::exit(0);
+                                                    trace("[update] restart pressed");
+                                                    match relaunch_app() {
+                                                        Ok(()) => {
+                                                            trace(
+                                                                "[update] relaunch requested, exiting",
+                                                            );
+                                                            std::process::exit(0);
+                                                        }
+                                                        Err(message) => {
+                                                            trace(&format!("[update] {message}"));
+                                                            update.set(UpdateCheck::Failed {
+                                                                message,
+                                                            });
+                                                        }
+                                                    }
                                                 })
                                                 .child(
                                                     text("重启").text_size(px(11.0)).text_color(
@@ -2387,6 +2433,7 @@ pub fn App() -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     /// The feed's newest entry is what "is there a newer release" reads.
     /// The download itself is covered by `tests/updater.rs`, which drives
@@ -2433,6 +2480,29 @@ mod tests {
         assert_eq!(
             progress_percent("frame= 1 ... time=00:00:30.00 ...", 10.0),
             Some(1.0)
+        );
+    }
+
+    /// The updater must relaunch the bundle it actually replaced, not a
+    /// hard-coded `/Applications` path that may not be where the app lives.
+    #[test]
+    fn bundle_from_exe_finds_the_enclosing_app() {
+        assert_eq!(
+            bundle_from_exe(Path::new("/Applications/轻影.app/Contents/MacOS/App")),
+            Some(PathBuf::from("/Applications/轻影.app"))
+        );
+        assert_eq!(bundle_from_exe(Path::new("/tmp/plain/App")), None);
+    }
+
+    /// `open` without `-n` only activates the instance that is about to exit.
+    #[test]
+    fn relaunch_opens_a_new_instance_of_the_real_bundle() {
+        let bundle = PathBuf::from("/Users/me/Applications/轻影.app");
+        let command = relaunch_command(&bundle);
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/open"));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [OsStr::new("-n"), bundle.as_os_str()]
         );
     }
 }

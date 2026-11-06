@@ -7,7 +7,7 @@ test("shows the drop zone and the controls", async () => {
   const app = await open(".");
   const texts = app.texts();
   expect(texts).toContain("轻影");
-  expect(texts).toContain("把视频拖到这里");
+  expect(texts).toContain("拖到窗口任意位置");
   // the drop target says a folder works too
   expect(texts.join(" ")).toContain("文件夹");
   expect(texts).toContain("选择文件");
@@ -21,7 +21,7 @@ test("switches the quality preset", async () => {
   const app = await open(".");
   await app.press("高画质");
   // the press is accepted and the app still shows its drop zone
-  expect(app.texts()).toContain("把视频拖到这里");
+  expect(app.texts()).toContain("拖到窗口任意位置");
 });
 
 // Each preset says what it means. The hint is a tooltip: absent from the
@@ -69,6 +69,13 @@ test("dropped files wait in a list instead of encoding at once", async () => {
   expect(texts.join(" ")).not.toContain("HEVC + 透明");
 });
 
+// The whole window is the drop target, not just the box in the middle.
+test("a file dropped anywhere in the window is accepted", async () => {
+  const app = await open(".", { platform: "macos" });
+  await app.dropFiles("id:app-root", [clip(1)]);
+  await app.waitFor("text:1 个文件待压缩");
+});
+
 test("a file can be taken back out before the run starts", async () => {
   const app = await open(".", { platform: "macos" });
   await app.dropFiles("id:dropzone", [clip(1), clip(2)]);
@@ -89,7 +96,7 @@ test("clearing the list goes back to the empty window", async () => {
   await app.waitFor("text:1 个文件待压缩");
 
   await app.press("清空");
-  await app.waitFor("text:把视频拖到这里");
+  await app.waitFor("text:拖到窗口任意位置");
 
   // the list's controls are gone with it
   expect(app.texts()).not.toContain("开始压缩");
@@ -137,7 +144,7 @@ test("a run that is not stopped finishes with its tallies", async () => {
 test("the pick button is pressable", async () => {
   const app = await open(".");
   await app.press("选择文件");
-  expect(app.texts()).toContain("把视频拖到这里");
+  expect(app.texts()).toContain("拖到窗口任意位置");
 });
 
 // The result card only exists once a file has been encoded, so it is absent
