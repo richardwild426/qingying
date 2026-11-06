@@ -709,7 +709,7 @@ const RELEASES_FEED: &str = "https://github.com/richardwild426/qingying/releases
 const RELEASES_PAGE: &str = "https://github.com/richardwild426/qingying/releases/latest";
 
 /// What the update check found.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 enum UpdateCheck {
     /// Nothing asked yet.
     Idle,
@@ -808,8 +808,86 @@ fn temp_dmg_path() -> Option<PathBuf> {
 
 /// What a download reports back to the engine thread.
 enum DownloadEvent {
+    /// Bytes on disk so far, and the size the server announced (0 unknown).
+    Progress {
+        received: u64,
+        total: u64,
+    },
     Installed,
     Failed(String),
+}
+
+/// Download `url` to `dest` with `curl`, reporting bytes as they land.
+///
+/// Not `fetch`: that hands back the whole body at once, so the only progress
+/// it can show is 0% until it is done — which is indistinguishable from a
+/// download that never started. `curl` writes to the file as it goes, and
+/// polling the file's size is what gives a real number. It also follows the
+/// redirect to `release-assets.githubusercontent.com` itself.
+///
+/// Runs on a worker thread; the engine thread polls the file it writes.
+fn download_with_curl(
+    url: &str,
+    dest: &PathBuf,
+    report: &dyn Fn(DownloadEvent),
+) -> Result<(), String> {
+    let _ = std::fs::remove_file(dest);
+
+    let mut child = std::process::Command::new("/usr/bin/curl")
+        .args(["-fsSL", "--retry", "2", "--connect-timeout", "20", "-o"])
+        .arg(dest)
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl 启动失败：{e}"))?;
+
+    // How large the download will be is not known here: curl writes to the
+    // file without telling us the announced length. The UI shows the bytes
+    // received, which is the number that has to move.
+    let total = 0u64;
+    let mut last = 0u64;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(e) => return Err(format!("等待下载失败：{e}")),
+        }
+        let received = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        if received != last {
+            last = received;
+            report(DownloadEvent::Progress { received, total });
+        }
+        std::thread::sleep(Duration::from_millis(120));
+    }
+
+    // curl's exit status says whether the file is whole; `-f` makes an HTTP
+    // error a failure rather than a body written to disk.
+    let status = child.wait().map_err(|e| format!("等待下载失败：{e}"))?;
+    if !status.success() {
+        let mut why = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_string(&mut why);
+        }
+        let _ = std::fs::remove_file(dest);
+        let why = why.trim();
+        return Err(if why.is_empty() {
+            format!("下载失败：curl 退出码 {}", status.code().unwrap_or(-1))
+        } else {
+            format!("下载失败：{why}")
+        });
+    }
+
+    let received = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    if received == 0 {
+        let _ = std::fs::remove_file(dest);
+        return Err("下载失败：文件是空的".into());
+    }
+    report(DownloadEvent::Progress {
+        received,
+        total: received,
+    });
+    Ok(())
 }
 
 /// Mount the image, copy the app over the running one, and unmount.
@@ -1324,37 +1402,52 @@ pub fn App() -> impl IntoElement {
     // Checking is manual, and one check runs at a time: `fetch` is awaited in
     // a task the engine owns, so the signals it writes stay on the engine
     // thread.
+    // The owner of the app's own layout, captured once, before anything can
+    // press a button. What a press handler creates belongs to the region it
+    // ran in, and is disposed with it — a timer, a spawned task, even a
+    // signal. Both the batch pump and the update download outlive the
+    // button that started them, so they are made under this owner instead.
+    let app_owner = Owner::current();
+
     let check_now = {
         let current = current_version.clone();
         move || {
             if matches!(update.get(), UpdateCheck::Checking) {
                 return;
             }
+            trace("[update] check pressed");
             update.set(UpdateCheck::Checking);
             let current = current.clone();
-            spawn(async move {
-                let request = HttpRequest::get(RELEASES_FEED);
-                match fetch(request).await {
-                    Ok(response) if response.ok() => match parse_latest_release(&response.text()) {
-                        Ok((tag, url)) => {
-                            if is_newer(&tag, &current) {
-                                update.set(UpdateCheck::Available {
-                                    current,
-                                    latest: tag,
-                                    url,
-                                    asset: ASSET_NAME.to_string(),
-                                });
-                            } else {
-                                update.set(UpdateCheck::UpToDate { current });
+            // Under the app's owner: `update.set` above swaps the button that
+            // was pressed out of the window, and a task made in its region
+            // would be cancelled before it could finish.
+            app_owner.run(move || {
+                spawn(async move {
+                    let request = HttpRequest::get(RELEASES_FEED);
+                    match fetch(request).await {
+                        Ok(response) if response.ok() => {
+                            match parse_latest_release(&response.text()) {
+                                Ok((tag, url)) => {
+                                    if is_newer(&tag, &current) {
+                                        update.set(UpdateCheck::Available {
+                                            current,
+                                            latest: tag,
+                                            url,
+                                            asset: ASSET_NAME.to_string(),
+                                        });
+                                    } else {
+                                        update.set(UpdateCheck::UpToDate { current });
+                                    }
+                                }
+                                Err(message) => update.set(UpdateCheck::Failed { message }),
                             }
                         }
+                        Ok(response) => update.set(UpdateCheck::Failed {
+                            message: format!("GitHub 返回 HTTP {}", response.status()),
+                        }),
                         Err(message) => update.set(UpdateCheck::Failed { message }),
-                    },
-                    Ok(response) => update.set(UpdateCheck::Failed {
-                        message: format!("GitHub 返回 HTTP {}", response.status()),
-                    }),
-                    Err(message) => update.set(UpdateCheck::Failed { message }),
-                }
+                    }
+                })
             });
         }
     };
@@ -1367,6 +1460,7 @@ pub fn App() -> impl IntoElement {
     // thread apply what it reports.
     let install_now = {
         move || {
+            trace(&format!("[update] install_now; state={:?}", update.get()));
             let UpdateCheck::Available { latest, .. } = update.get() else {
                 return;
             };
@@ -1383,35 +1477,35 @@ pub fn App() -> impl IntoElement {
             });
 
             let name = bundle_name();
-            spawn(async move {
-                let url = asset_url(&latest);
-                trace(&format!("[update] downloading {url}"));
-                let bytes = match fetch(HttpRequest::get(&url)).await {
-                    Ok(r) if r.ok() => r.body,
-                    Ok(r) => {
-                        update.set(UpdateCheck::Failed {
-                            message: format!("下载失败：HTTP {}", r.status()),
-                        });
-                        return;
-                    }
-                    Err(message) => {
-                        update.set(UpdateCheck::Failed { message });
-                        return;
-                    }
-                };
-                trace(&format!("[update] {} bytes", bytes.len()));
-
-                // The bytes must hit disk before hdiutil can mount them.
+            // Under the app's owner, for the same reason as `check_now`: the
+            // `Downloading` state above replaces the button that was pressed,
+            // so a task made in that button's region would be cancelled
+            // immediately — the download then never starts, and the window
+            // sits at 0% with nothing in the log.
+            app_owner.run(move || {
+                // Everything happens on a worker: `curl` blocks while it
+                // downloads and `hdiutil` blocks while it mounts. The engine
+                // thread only polls the channel, so the window keeps drawing
+                // and the progress number is a real byte count.
                 let (tx, rx) = std::sync::mpsc::channel::<DownloadEvent>();
+                let worker_latest = latest.clone();
                 std::thread::spawn(move || {
+                    let url = asset_url(&worker_latest);
+                    trace(&format!("[update] downloading {url}"));
                     let Some(dmg) = temp_dmg_path() else {
                         let _ = tx.send(DownloadEvent::Failed("找不到临时目录".into()));
                         return;
                     };
-                    if let Err(e) = std::fs::write(&dmg, &bytes) {
-                        let _ = tx.send(DownloadEvent::Failed(format!("写入镜像失败：{e}")));
+                    let sender = tx.clone();
+                    let report = move |event: DownloadEvent| {
+                        let _ = sender.send(event);
+                    };
+                    if let Err(message) = download_with_curl(&url, &dmg, &report) {
+                        trace(&format!("[update] {message}"));
+                        let _ = tx.send(DownloadEvent::Failed(message));
                         return;
                     }
+                    trace("[update] downloaded, installing");
                     let event = match install_from_dmg(&dmg, &name) {
                         Ok(()) => DownloadEvent::Installed,
                         Err(message) => DownloadEvent::Failed(message),
@@ -1430,19 +1524,46 @@ pub fn App() -> impl IntoElement {
                     let Some(rx) = finished.borrow_mut().take() else {
                         return;
                     };
-                    match rx.try_recv() {
-                        Ok(DownloadEvent::Installed) => {
+                    // Drain what arrived, keeping the last progress so a burst
+                    // of them does not redraw once per event.
+                    let mut last_progress = None;
+                    let mut outcome: Option<Option<String>> = None;
+                    loop {
+                        match rx.try_recv() {
+                            Ok(DownloadEvent::Progress { received, total }) => {
+                                last_progress = Some((received, total));
+                            }
+                            Ok(DownloadEvent::Installed) => {
+                                outcome = Some(None);
+                                break;
+                            }
+                            Ok(DownloadEvent::Failed(message)) => {
+                                outcome = Some(Some(message));
+                                break;
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    if let Some((received, total)) = last_progress {
+                        update.set(UpdateCheck::Downloading {
+                            latest: latest.clone(),
+                            received,
+                            total,
+                        });
+                    }
+                    match outcome {
+                        Some(None) => {
                             done.set(true);
                             update.set(UpdateCheck::Installed {
                                 latest: latest.clone(),
                             });
                         }
-                        Ok(DownloadEvent::Failed(message)) => {
+                        Some(Some(message)) => {
                             done.set(true);
                             update.set(UpdateCheck::Failed { message });
                         }
-                        Err(TryRecvError::Empty) => *finished.borrow_mut() = Some(rx),
-                        Err(TryRecvError::Disconnected) => done.set(true),
+                        None => *finished.borrow_mut() = Some(rx),
                     }
                 });
             });
@@ -1452,12 +1573,6 @@ pub fn App() -> impl IntoElement {
     // The stop flag of the run in progress, if any. A signal so the button
     // that sets it and the worker that reads it share one flag, and so that
     // `start` stays `Copy` (a closure capturing an `Rc` would not be, and it
-    // is used from more than one handler).
-    // The owner of the app's own layout, captured once. What a press handler
-    // makes belongs to the region it ran in, which is not what a batch's
-    // timer should die with — see `pump`.
-    let app_owner = Owner::current();
-
     let cancel = signal(None::<Cancel>);
     // What a scan is adding to: the files already waiting, which it adds to
     // rather than replaces.
@@ -2214,4 +2329,98 @@ pub fn App() -> impl IntoElement {
                     ),
             ),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A local file served over HTTP, so the download is exercised for real
+    /// without touching GitHub or opening a window.
+    fn serve(bytes: Vec<u8>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, Write};
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Read the request line and headers; the body is not needed.
+                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&bytes);
+                let _ = stream.flush();
+            }
+        });
+        (format!("http://127.0.0.1:{port}/app.dmg"), hits)
+    }
+
+    #[test]
+    fn a_download_writes_the_file_and_reports_its_bytes() {
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let (url, _hits) = serve(payload.clone());
+        let dir = std::env::temp_dir().join(format!("qy-dl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let dest = dir.join("out.dmg");
+
+        let reported = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = reported.clone();
+        download_with_curl(&url, &dest, &move |event| {
+            if let DownloadEvent::Progress { received, .. } = event {
+                sink.borrow_mut().push(received);
+            }
+        })
+        .expect("download");
+
+        let written = std::fs::read(&dest).expect("read");
+        assert_eq!(written, payload, "the file must be the body, byte for byte");
+
+        // Progress is what the old code could not show: at least one report,
+        // and the last one is the whole file.
+        let reports = reported.borrow();
+        assert!(!reports.is_empty(), "progress must be reported");
+        assert_eq!(
+            *reports.last().expect("last"),
+            payload.len() as u64,
+            "the last report is the finished size"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_url_fails_instead_of_leaving_a_file() {
+        // Port 1 refuses connections: curl fails, and no partial file is left.
+        let dir = std::env::temp_dir().join(format!("qy-dl-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let dest = dir.join("out.dmg");
+        std::fs::write(&dest, b"stale").expect("stale");
+
+        let result = download_with_curl("http://127.0.0.1:1/nothing.dmg", &dest, &|_| {});
+        assert!(result.is_err(), "a refused connection is a failure");
+        assert!(!dest.exists(), "a failed download leaves nothing behind");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_newer_release_is_detected_from_the_feed() {
+        let feed = r#"<feed><entry><title>v9.9.9</title>
+            <link href="https://github.com/x/y/releases/tag/v9.9.9"/></entry></feed>"#;
+        let (tag, url) = parse_latest_release(feed).expect("parse");
+        assert_eq!(tag, "v9.9.9");
+        assert!(url.contains("v9.9.9"));
+        assert!(is_newer(&tag, "1.5.0"));
+        assert!(!is_newer("1.5.0", "1.5.0"));
+    }
 }
