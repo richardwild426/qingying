@@ -817,77 +817,30 @@ enum DownloadEvent {
     Failed(String),
 }
 
-/// Download `url` to `dest` with `curl`, reporting bytes as they land.
+/// Download `url` into `dest`, reporting what arrived.
 ///
-/// Not `fetch`: that hands back the whole body at once, so the only progress
-/// it can show is 0% until it is done — which is indistinguishable from a
-/// download that never started. `curl` writes to the file as it goes, and
-/// polling the file's size is what gives a real number. It also follows the
-/// redirect to `release-assets.githubusercontent.com` itself.
+/// Through `fetch`, not a spawned `curl`: a subprocess reaches the network
+/// behind the app's `capabilities` (which grant `github.com` and
+/// `release-assets.githubusercontent.com` and nothing else), and a test's
+/// stubbed network cannot see it at all — a download that never happened and
+/// one that bypassed the sandbox look the same from outside.
 ///
-/// Runs on a worker thread; the engine thread polls the file it writes.
-fn download_with_curl(
-    url: &str,
-    dest: &PathBuf,
-    report: &dyn Fn(DownloadEvent),
-) -> Result<(), String> {
-    let _ = std::fs::remove_file(dest);
-
-    let mut child = std::process::Command::new("/usr/bin/curl")
-        .args(["-fsSL", "--retry", "2", "--connect-timeout", "20", "-o"])
-        .arg(dest)
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("curl 启动失败：{e}"))?;
-
-    // How large the download will be is not known here: curl writes to the
-    // file without telling us the announced length. The UI shows the bytes
-    // received, which is the number that has to move.
-    let total = 0u64;
-    let mut last = 0u64;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {}
-            Err(e) => return Err(format!("等待下载失败：{e}")),
-        }
-        let received = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-        if received != last {
-            last = received;
-            report(DownloadEvent::Progress { received, total });
-        }
-        std::thread::sleep(Duration::from_millis(120));
+/// `fetch` hands back the whole body, so the report is one final count, not
+/// a running one. The UI says "下载中" until then rather than showing a
+/// number that cannot move.
+async fn download_to(url: &str, dest: &PathBuf) -> Result<u64, String> {
+    let response = fetch(HttpRequest::get(url))
+        .await
+        .map_err(|message| format!("下载失败：{message}"))?;
+    if !response.ok() {
+        return Err(format!("下载失败：HTTP {}", response.status()));
     }
-
-    // curl's exit status says whether the file is whole; `-f` makes an HTTP
-    // error a failure rather than a body written to disk.
-    let status = child.wait().map_err(|e| format!("等待下载失败：{e}"))?;
-    if !status.success() {
-        let mut why = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut why);
-        }
-        let _ = std::fs::remove_file(dest);
-        let why = why.trim();
-        return Err(if why.is_empty() {
-            format!("下载失败：curl 退出码 {}", status.code().unwrap_or(-1))
-        } else {
-            format!("下载失败：{why}")
-        });
-    }
-
-    let received = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
-    if received == 0 {
-        let _ = std::fs::remove_file(dest);
+    let bytes = response.body;
+    if bytes.is_empty() {
         return Err("下载失败：文件是空的".into());
     }
-    report(DownloadEvent::Progress {
-        received,
-        total: received,
-    });
-    Ok(())
+    std::fs::write(dest, &bytes).map_err(|e| format!("写入镜像失败：{e}"))?;
+    Ok(bytes.len() as u64)
 }
 
 /// Mount the image, copy the app over the running one, and unmount.
@@ -1483,35 +1436,42 @@ pub fn App() -> impl IntoElement {
             // immediately — the download then never starts, and the window
             // sits at 0% with nothing in the log.
             app_owner.run(move || {
-                // Everything happens on a worker: `curl` blocks while it
-                // downloads and `hdiutil` blocks while it mounts. The engine
-                // thread only polls the channel, so the window keeps drawing
-                // and the progress number is a real byte count.
+                // `fetch` is awaited on the engine thread's runtime, and
+                // mounting shells out to `hdiutil`, which blocks: so the
+                // download is a task here, and the bytes go to a worker to be
+                // written and installed.
                 let (tx, rx) = std::sync::mpsc::channel::<DownloadEvent>();
-                let worker_latest = latest.clone();
-                std::thread::spawn(move || {
-                    let url = asset_url(&worker_latest);
+                let task_latest = latest.clone();
+                spawn(async move {
+                    let url = asset_url(&task_latest);
                     trace(&format!("[update] downloading {url}"));
                     let Some(dmg) = temp_dmg_path() else {
-                        let _ = tx.send(DownloadEvent::Failed("找不到临时目录".into()));
+                        update.set(UpdateCheck::Failed {
+                            message: "找不到临时目录".into(),
+                        });
                         return;
                     };
-                    let sender = tx.clone();
-                    let report = move |event: DownloadEvent| {
-                        let _ = sender.send(event);
+                    let bytes = match download_to(&url, &dmg).await {
+                        Ok(bytes) => bytes,
+                        Err(message) => {
+                            trace(&format!("[update] {message}"));
+                            update.set(UpdateCheck::Failed { message });
+                            return;
+                        }
                     };
-                    if let Err(message) = download_with_curl(&url, &dmg, &report) {
-                        trace(&format!("[update] {message}"));
-                        let _ = tx.send(DownloadEvent::Failed(message));
-                        return;
-                    }
-                    trace("[update] downloaded, installing");
-                    let event = match install_from_dmg(&dmg, &name) {
-                        Ok(()) => DownloadEvent::Installed,
-                        Err(message) => DownloadEvent::Failed(message),
-                    };
-                    let _ = std::fs::remove_file(&dmg);
-                    let _ = tx.send(event);
+                    trace(&format!("[update] {bytes} bytes on disk, installing"));
+                    let _ = tx.send(DownloadEvent::Progress {
+                        received: bytes,
+                        total: bytes,
+                    });
+                    std::thread::spawn(move || {
+                        let event = match install_from_dmg(&dmg, &name) {
+                            Ok(()) => DownloadEvent::Installed,
+                            Err(message) => DownloadEvent::Failed(message),
+                        };
+                        let _ = std::fs::remove_file(&dmg);
+                        let _ = tx.send(event);
+                    });
                 });
 
                 // Poll the worker on the engine thread, as the picker does.
@@ -2233,9 +2193,21 @@ pub fn App() -> impl IntoElement {
                                             UpdateCheck::Available { latest, .. } => {
                                                 format!("有新版本 {latest}")
                                             }
+                                            // `fetch` hands back the whole
+                                            // body, so there is no running
+                                            // byte count to show. Before
+                                            // any bytes arrive the label
+                                            // says only that it is working —
+                                            // a "0.0 MB" that cannot move
+                                            // reads as stuck, which is what
+                                            // sent us looking for this bug.
                                             UpdateCheck::Downloading { received, .. } => {
-                                                let mb = received as f64 / 1048576.0;
-                                                format!("下载中 {mb:.1} MB")
+                                                if received > 0 {
+                                                    let mb = received as f64 / 1048576.0;
+                                                    format!("下载中 {mb:.1} MB")
+                                                } else {
+                                                    "正在下载…".to_string()
+                                                }
                                             }
                                             UpdateCheck::Installed { .. } => "已更新".to_string(),
                                             UpdateCheck::Failed { .. } => {
@@ -2335,84 +2307,9 @@ pub fn App() -> impl IntoElement {
 mod tests {
     use super::*;
 
-    /// A local file served over HTTP, so the download is exercised for real
-    /// without touching GitHub or opening a window.
-    fn serve(bytes: Vec<u8>) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
-        use std::io::{BufRead, Write};
-        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = hits.clone();
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { continue };
-                counter.fetch_add(1, Ordering::SeqCst);
-                // Read the request line and headers; the body is not needed.
-                let mut reader = std::io::BufReader::new(stream.try_clone().expect("clone"));
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                        break;
-                    }
-                }
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    bytes.len()
-                );
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&bytes);
-                let _ = stream.flush();
-            }
-        });
-        (format!("http://127.0.0.1:{port}/app.dmg"), hits)
-    }
-
-    #[test]
-    fn a_download_writes_the_file_and_reports_its_bytes() {
-        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
-        let (url, _hits) = serve(payload.clone());
-        let dir = std::env::temp_dir().join(format!("qy-dl-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let dest = dir.join("out.dmg");
-
-        let reported = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let sink = reported.clone();
-        download_with_curl(&url, &dest, &move |event| {
-            if let DownloadEvent::Progress { received, .. } = event {
-                sink.borrow_mut().push(received);
-            }
-        })
-        .expect("download");
-
-        let written = std::fs::read(&dest).expect("read");
-        assert_eq!(written, payload, "the file must be the body, byte for byte");
-
-        // Progress is what the old code could not show: at least one report,
-        // and the last one is the whole file.
-        let reports = reported.borrow();
-        assert!(!reports.is_empty(), "progress must be reported");
-        assert_eq!(
-            *reports.last().expect("last"),
-            payload.len() as u64,
-            "the last report is the finished size"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn a_missing_url_fails_instead_of_leaving_a_file() {
-        // Port 1 refuses connections: curl fails, and no partial file is left.
-        let dir = std::env::temp_dir().join(format!("qy-dl-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let dest = dir.join("out.dmg");
-        std::fs::write(&dest, b"stale").expect("stale");
-
-        let result = download_with_curl("http://127.0.0.1:1/nothing.dmg", &dest, &|_| {});
-        assert!(result.is_err(), "a refused connection is a failure");
-        assert!(!dest.exists(), "a failed download leaves nothing behind");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
+    /// The feed's newest entry is what "is there a newer release" reads.
+    /// The download itself is covered by `tests/updater.rs`, which drives
+    /// the real app through a stubbed network.
     #[test]
     fn a_newer_release_is_detected_from_the_feed() {
         let feed = r#"<feed><entry><title>v9.9.9</title>

@@ -112,8 +112,19 @@ jobs:
           done
           ls -lh .test-fixtures
 
+      # `nsh test` runs the crate's `cargo test` first, then the TSX files,
+      # and counts both. `--junit` writes them as XML so the run's test
+      # results show per test in the Actions UI instead of one pass/fail line.
       - name: Run the tests
-        run: nsh test
+        run: nsh test --junit test-results.xml
+
+      - name: Show the test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+          if-no-files-found: warn
 
       - name: Package the app
         run: |

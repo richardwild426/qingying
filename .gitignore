@@ -10,3 +10,6 @@ target/
 # The clips the waiting-list tests drop on the window (the CI step makes
 # them), and the outputs the tests encode from them.
 .test-fixtures/
+
+# The JUnit report `nsh test --junit` writes (CI uploads it).
+test-results.xml

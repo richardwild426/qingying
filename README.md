@@ -200,24 +200,75 @@ nsh 版本生效时准备的。
 ## 测试
 
 ```sh
-nsh test
+nsh test                                  # 全部：Rust 测试 + TSX 测试
+cargo test                                # 只跑 Rust 的
+nsh test --filter 中断                     # 名字里含「中断」的
+nsh test --junit test-results.xml         # 另写 JUnit 报告（CI 用）
 ```
 
-headless 跑 UI。除了控件和文本，还真的覆盖了这次新增的交互：
+**都是 headless 的。** NSH 跑的是真引擎（同一个反应图、渲染器、组件、布局），
+只是没有窗口——所以测试里能点、能拖、能等，而且不抢屏幕、不需要模拟器。
+这一点很重要：靠 `open` 一个 .app 再模拟点击去验证，既慢又干扰人，还不进 CI。
 
-- **画质提示**：用 `app.hover("id:quality-high")` 把鼠标停在档位上，等 tooltip 出来，
-  断言提示文字里有「最接近原片」和「CRF 15」。tooltip 必须用 `platform: "macos"`
-  打开才有鼠标。
-- **待压缩列表**：`app.dropFiles("id:dropzone", [...])` 真的拖文件进去，断言出现
-  「N 个文件待压缩」且没有开始编码。
-- **移除 / 清空**：点「移除」后断言对应文件名从屏幕上消失（这条测试抓到过 `each`
-  不跟随信号的 bug）。
+### Rust 测试：`tests/updater.rs`
+
+更新器的问题只有 Rust 侧能测到。用 `nsh_testing::Headless` + `StubNetwork` 起真 app，
+把 GitHub 的 feed 和 DMG 打桩，然后**断言 app 向网络请求了什么**：
+
+```rust
+let network = Arc::new(StubNetwork::new([
+    (format!("GET {FEED}"), response(200, ATOM.as_bytes())),
+    (format!("GET {ASSET}"), response(200, b"not a dmg")),
+]));
+let mut config = EngineConfig::new(Root::of::<nsh_app_video_squeezer::App>());
+config.network = Some(network.clone());
+let mut app = Headless::start(config)?;
+app.wait_for("text:轻影")?;        // 首帧还没渲染，必须先等一帧
+
+app.press("text:检查更新")?;
+app.wait_for("text:/有新版本/")?;
+app.press("text:立即更新")?;
+app.wait_until("请求资源", Duration::from_secs(10), |_| network.requests().len() >= 2)?;
+```
+
+三个断言：
+
+1. 检查更新只请求 feed
+2. **点「立即更新」必须真的发出资源请求**（这条抓的就是「下载卡在 0」——修复前
+   `network.requests()` 只有 1 条，任务在被按下的按钮所在的 region 销毁时就被取消了）
+3. 状态必须离开 0（不能停在 `下载中 0.0 MB`）
+
+**验证测试本身有效**：用修复前的 `src/lib.rs` 跑这三个测试，第 2、3 条失败，
+屏幕内容正是用户看到的 `下载中 0.0 MB`。测试确实复现了那个 bug。
+
+### TSX 测试：`App.test.tsx`
+
+UI 交互在 TSX 里写，选择器与 Rust 侧一致：
+
+- **画质提示**：`await app.hover("id:quality-high")` 真的悬停等 tooltip，断言含
+  「最接近原片」「CRF 15」。tooltip 需要指针，必须 `open(".", { platform: "macos" })`，
+  默认 iOS 会报 "a phone has no mouse"。
+- **待压缩列表**：`await app.dropFiles("id:dropzone", [uris])` 真的拖文件。
+- **移除 / 清空**：断言文件名从屏幕上消失（这条抓到过 `each` 不跟随信号的 bug）。
 - **中断**：开始压缩后点「中断」，断言出现「已中断」且**没有**「个失败」。
-- **正常跑完**：不中断的情况给出结果卡片和打开按钮。
+- **正常跑完**：不中断时给出结果卡片和打开按钮。
+
+`hover` / `wait` 是 async 要 `await`；没有 `waitFor(ms)`，是 `wait(ms)`；
+选择器多匹配要 `>> nth=0`。
 
 测试素材 `.test-fixtures/clip{1,2,3}.mp4` 由 CI 用 ffmpeg 现场生成（720p / 12 秒，
-足够长到能被打断），不入库。本地跑测试前需要先生成一次，命令见 workflow 的
-「Make the test clips」一步。
+够长才能被打断），不入库。本地跑之前先生成一次，命令见 workflow 的
+「Make the test clips」。
+
+### 测试里不要做的事
+
+- **不要 `open` 打包好的 .app 再模拟点击**。那是手工验证，不是测试：它抢前台、
+  依赖屏幕分辨率、点偏了会点到别的窗口，而且 CI 跑不了。headless 全都能做。
+- **不要用子进程（`curl` 等）访问网络**。它绕过 `capabilities`，也让
+  `StubNetwork` 看不见——「下载没发生」和「下载绕过了沙箱」在测试里长得一样。
+  这也是更新器改回 `fetch` 的原因。
+- **不要在 `Headless::start` 之后立刻 `press`**。首帧还没渲染，屏幕是空的；
+  先 `wait_for` 一个必然存在的文本。
 
 压缩逻辑本身用 ffmpeg 直接验证过：860 MB 的 QTRLE 素材 → 30 MB，透明像素数与原片完全一致（601389/2073600）。
 
