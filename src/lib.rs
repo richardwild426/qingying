@@ -5,7 +5,7 @@
 //! VideoToolbox (`-pix_fmt yuva420p -alpha_quality 1`), so the transparency
 //! survives; everything else becomes H.264 in an MP4.
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufReader, Read};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -378,6 +378,45 @@ impl PartialEq for Cancel {
     }
 }
 
+/// Stream ffmpeg's stderr one record at a time, on either separator.
+///
+/// Live stats end in `\r` so a terminal overwrites the previous report in
+/// place; diagnostics and the final report use `\n`. `BufRead::lines` only
+/// splits on the latter, which held the whole encode in one buffer and left
+/// the progress bar at 0 until ffmpeg exited.
+fn stream_ffmpeg_output<R: Read>(reader: R, tx: Sender<String>) {
+    let mut record = Vec::new();
+    for byte in BufReader::new(reader).bytes().map_while(Result::ok) {
+        match byte {
+            b'\r' | b'\n' => {
+                if record.is_empty() {
+                    continue;
+                }
+                let text = String::from_utf8_lossy(&record).into_owned();
+                record.clear();
+                if tx.send(text).is_err() {
+                    return;
+                }
+            }
+            _ => record.push(byte),
+        }
+    }
+    if !record.is_empty() {
+        let _ = tx.send(String::from_utf8_lossy(&record).into_owned());
+    }
+}
+
+/// `frame=... time=00:00:07.20 ...` → how far into `duration` that is.
+///
+/// The first report ffmpeg emits has `time=N/A`; there is no fraction to show
+/// until a real timestamp arrives.
+fn progress_percent(line: &str, duration: f64) -> Option<f64> {
+    let (_, rest) = line.split_once("time=")?;
+    let stamp = rest.split_whitespace().next()?;
+    let seconds = parse_timestamp(stamp)?;
+    Some((seconds / duration).clamp(0.0, 1.0))
+}
+
 /// Encode `source`, reporting progress through `on_progress`.
 ///
 /// Returns the output's size and path, or a message to show the user.
@@ -447,36 +486,27 @@ fn encode_one(
 
     let mut child = cmd.spawn().map_err(|e| format!("ffmpeg 启动失败：{e}"))?;
 
-    // ffmpeg reports progress on stderr as `... time=00:00:07.20 ...`.
+    // ffmpeg reports progress on stderr as `... time=00:00:07.20 ...`, with
+    // each live report separated by `\r` rather than `\n`.
     let Some(stderr) = child.stderr.take() else {
         let _ = child.wait();
         return Err("读不到 ffmpeg 的进度输出".into());
     };
     // ffmpeg's stderr is read on its own thread so this one can keep looking
     // at the cancel flag. Reading it inline would block on `read` until the
-    // next line arrives, and a stalled ffmpeg would then ignore the user's
+    // next record arrives, and a stalled ffmpeg would then ignore the user's
     // stop for as long as it stalled.
     let (lines_tx, lines_rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if lines_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    std::thread::spawn(move || stream_ffmpeg_output(stderr, lines_tx));
 
     let mut last_error = String::new();
     let mut stopped = false;
     loop {
         match lines_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
-                if let Some(pos) = line.find("time=") {
-                    let rest = &line[pos + 5..];
-                    let stamp: String = rest.chars().take_while(|c| *c != ' ').collect();
-                    if let Some(seconds) = parse_timestamp(&stamp) {
-                        on_progress((seconds / duration).clamp(0.0, 1.0), has_alpha);
-                    }
-                } else if !line.trim().is_empty() {
+                if let Some(pct) = progress_percent(&line, duration) {
+                    on_progress(pct, has_alpha);
+                } else if !line.contains("time=") && !line.trim().is_empty() {
                     last_error = line;
                 }
             }
@@ -2319,5 +2349,39 @@ mod tests {
         assert!(url.contains("v9.9.9"));
         assert!(is_newer(&tag, "1.5.0"));
         assert!(!is_newer("1.5.0", "1.5.0"));
+    }
+
+    /// ffmpeg overwrites one live report with the next using `\r`; treating
+    /// only `\n` as a separator used to leave the progress bar at 0% until
+    /// the encode was over. A CRLF pair must not add an empty record either.
+    #[test]
+    fn carriage_return_stats_are_separate_progress_records() {
+        let output = concat!(
+            "ffmpeg version 8.0\n",
+            "frame=   0 ... time=N/A ...\r",
+            "frame=  30 ... time=00:00:01.00 ...\r",
+            "frame=  60 ... time=00:00:02.00 ...\r\n",
+            "[libx264 @ 0x1] done\n",
+            "frame=  90 ... time=00:00:03.00 ...",
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        stream_ffmpeg_output(output.as_bytes(), tx);
+        let records: Vec<String> = rx.into_iter().collect();
+
+        assert_eq!(records.len(), 6);
+        assert_eq!(progress_percent(&records[1], 4.0), None);
+        assert_eq!(progress_percent(&records[2], 4.0), Some(0.25));
+        assert_eq!(progress_percent(&records[3], 4.0), Some(0.5));
+        // The final report has no newline after it; it still arrives.
+        assert_eq!(progress_percent(&records[5], 4.0), Some(0.75));
+    }
+
+    #[test]
+    fn progress_stays_within_the_file_and_ignores_unavailable_time() {
+        assert_eq!(progress_percent("frame= 1 ... time=N/A ...", 10.0), None);
+        assert_eq!(
+            progress_percent("frame= 1 ... time=00:00:30.00 ...", 10.0),
+            Some(1.0)
+        );
     }
 }
