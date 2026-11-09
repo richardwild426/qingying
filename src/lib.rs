@@ -776,6 +776,23 @@ enum UpdateCheck {
     },
 }
 
+/// What the update row says while the DMG is arriving.
+///
+/// Rounding to one decimal place of a megabyte turns anything under ~50KB into
+/// "0.0 MB", which reads as a download that never started — the very symptom
+/// this label exists to avoid. So the unit follows the magnitude: bytes under
+/// a kilobyte keep the indeterminate "正在下载…", kilobytes show as KB, and
+/// only from a megabyte up does it count in MB.
+fn download_label(received: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    match received {
+        n if n < KB => "正在下载…".to_string(),
+        n if n < MB => format!("下载中 {:.0} KB", n as f64 / KB as f64),
+        n => format!("下载中 {:.1} MB", n as f64 / MB as f64),
+    }
+}
+
 /// Split `1.2.3` into comparable numbers, ignoring a leading `v`.
 ///
 /// A tag like `v1.2.3-beta` compares as `1.2.3`: a pre-release is this app's
@@ -2312,12 +2329,7 @@ pub fn App() -> impl IntoElement {
                                             // reads as stuck, which is what
                                             // sent us looking for this bug.
                                             UpdateCheck::Downloading { received, .. } => {
-                                                if received > 0 {
-                                                    let mb = received as f64 / 1048576.0;
-                                                    format!("下载中 {mb:.1} MB")
-                                                } else {
-                                                    "正在下载…".to_string()
-                                                }
+                                                download_label(received)
                                             }
                                             UpdateCheck::Installed { .. } => "已更新".to_string(),
                                             UpdateCheck::Failed { .. } => {
@@ -2447,6 +2459,31 @@ mod tests {
         assert!(url.contains("v9.9.9"));
         assert!(is_newer(&tag, "1.5.0"));
         assert!(!is_newer("1.5.0", "1.5.0"));
+    }
+
+    /// The update label must never show a byte count that rounds to zero:
+    /// "下载中 0.0 MB" is indistinguishable from a download that never
+    /// started, which is the bug this label was introduced to fix. A 9-byte
+    /// stub body used to produce exactly that.
+    #[test]
+    fn the_download_label_never_rounds_down_to_zero() {
+        for received in [0, 1, 9, 512, 1023] {
+            assert_eq!(
+                download_label(received),
+                "正在下载…",
+                "{received} bytes should not claim a size yet"
+            );
+        }
+        assert_eq!(download_label(1024), "下载中 1 KB");
+        assert_eq!(download_label(2048), "下载中 2 KB");
+        assert_eq!(download_label(1024 * 1024 - 1), "下载中 1024 KB");
+        assert_eq!(download_label(1024 * 1024), "下载中 1.0 MB");
+        assert_eq!(download_label(17 * 1024 * 1024), "下载中 17.0 MB");
+        // The regression itself: no input may render as a zero megabyte.
+        assert!(
+            !(0..2048).any(|n| download_label(n).contains("0.0 MB")),
+            "a small body still reads as a stuck download"
+        );
     }
 
     /// ffmpeg overwrites one live report with the next using `\r`; treating
